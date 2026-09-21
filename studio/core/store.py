@@ -55,9 +55,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_persona ON jobs(persona_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    persona_id TEXT NOT NULL REFERENCES personas(id),
+    state TEXT NOT NULL CHECK (state IN ('active', 'finalized')) DEFAULT 'active',
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    turn_count INTEGER NOT NULL DEFAULT 0,
+    summary TEXT                          -- LLM-Zusammenfassung, nach der Finalisierung
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_persona ON sessions(persona_id, started_at DESC);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     persona_id TEXT NOT NULL REFERENCES personas(id),
+    session_id TEXT REFERENCES sessions(id),   -- NULL = keine Call-Session (Batch/Telefonat)
     role TEXT NOT NULL CHECK (role IN ('user','assistant')),
     content TEXT NOT NULL,
     job_id TEXT,
@@ -134,6 +146,12 @@ class Store:
         ):
             if name not in cols:
                 self.conn.execute(ddl)
+        msg_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        if "session_id" not in msg_cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN session_id TEXT REFERENCES sessions(id)")
+        # erst nach der Spalte: auf alten DBs fehlt sie sonst noch (Startup-Crash)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -322,16 +340,19 @@ class Store:
     # -- messages (persistent conversation history) --------------------------
 
     def add_message(self, persona_id: str, role: str, content: str,
-                    *, job_id: str | None = None) -> dict:
+                    *, job_id: str | None = None, session_id: str | None = None) -> dict:
         mid = _uid()
         self.conn.execute(
-            "INSERT INTO messages (id, persona_id, role, content, job_id, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (mid, persona_id, role, content, job_id, _now()),
+            "INSERT INTO messages (id, persona_id, session_id, role, content, job_id, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (mid, persona_id, session_id, role, content, job_id, _now()),
         )
+        if session_id:
+            # turn_count zählt User- und Avatar-Beiträge (nicht Silent-Discard)
+            self.conn.execute("UPDATE sessions SET turn_count = turn_count + 1 WHERE id=?", (session_id,))
         self.conn.commit()
-        return {"id": mid, "persona_id": persona_id, "role": role,
-                "content": content, "job_id": job_id}
+        return {"id": mid, "persona_id": persona_id, "session_id": session_id,
+                "role": role, "content": content, "job_id": job_id}
 
     def get_history(self, persona_id: str, limit: int = 20) -> list[dict]:
         rows = self.conn.execute(
@@ -339,6 +360,64 @@ class Store:
             (persona_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    # -- sessions (Facetime-Calls) -------------------------------------------
+
+    def create_session(self, persona_id: str) -> dict:
+        sid = _uid()
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO sessions (id, persona_id, state, started_at) VALUES (?,?, 'active', ?)",
+            (sid, persona_id, now),
+        )
+        self.conn.commit()
+        return self.get_session(sid)
+
+    def get_session(self, session_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_sessions(self, persona_id: str | None = None, limit: int = 50) -> list[dict]:
+        if persona_id:
+            rows = self.conn.execute(
+                "SELECT * FROM sessions WHERE persona_id=? ORDER BY started_at DESC LIMIT ?",
+                (persona_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def session_transcript(self, session_id: str, limit: int | None = None) -> list[dict]:
+        """Transkript einer Session in Gesprächsreihenfolge (User + Avatar, ohne VLM)."""
+        sql = "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC"
+        params: list = [session_id]
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def finalize_session(self, session_id: str, *, summary: str | None = None) -> dict | None:
+        """active → finalized (idempotent). Zweiter Aufruf liefert die Zeile unverändert."""
+        row = self.get_session(session_id)
+        if row is None:
+            return None
+        if row["state"] != "active":
+            return row
+        sets = ["state='finalized'", "ended_at=?"]
+        params: list = [_now()]
+        if summary is not None:
+            sets.append("summary=?")
+            params.append(summary)
+        self.conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", (*params, session_id))
+        self.conn.commit()
+        return self.get_session(session_id)
+
+    def set_session_summary(self, session_id: str, summary: str) -> dict | None:
+        self.conn.execute("UPDATE sessions SET summary=? WHERE id=?", (summary, session_id))
+        self.conn.commit()
+        return self.get_session(session_id)
 
 
 def _first_embedding(data) -> list[float]:
