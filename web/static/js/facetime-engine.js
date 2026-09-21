@@ -26,11 +26,26 @@ export class FacetimeEngine {
 
   attach(canvas, fallbackEl, badgeEl) {
     this.canvas = canvas; this.fbEl = fallbackEl; this.badgeEl = badgeEl;
-    if (this.running) return;
-    this.init().catch(e => {
-      console.error('[facetime] init failed:', e);
-      this.showFallback('WebGL/VRM: ' + (e && e.message ? e.message : e));
-    });
+    if (this.running || this._initPending) return;   // laufende (Re-)Initialisierung übernehmen
+    this._initPending = true;
+    const attempt = async (n) => {
+      try {
+        await this.init();
+      } catch (e) {
+        console.error('[facetime] init failed:', e);
+        // View gewechselt? Dann abbrechen — das nächste attach() startet frisch.
+        if (!this.canvas.isConnected) { this._initPending = false; return; }
+        if (n >= 3) {
+          this._initPending = false;
+          this.showFallback('WebGL/VRM: ' + (e && e.message ? e.message : e));
+          return;
+        }
+        const delay = [2000, 5000, 10000][n];
+        if (this.badgeEl) this.badgeEl.textContent = `Neu laden (${n + 1}/3)…`;
+        setTimeout(() => attempt(n + 1), delay);
+      }
+    };
+    attempt(0);
   }
 
   showFallback(reason) {
@@ -44,9 +59,9 @@ export class FacetimeEngine {
   }
 
   async init() {
-    const THREE = await import('https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js');
-    const { GLTFLoader } = await import('https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/loaders/GLTFLoader.js');
-    const { VRMLoaderPlugin } = await import('https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.1.3/lib/three-vrm.module.min.js');
+    const THREE = await import('/static/vendor/three.module.js');
+    const { GLTFLoader } = await import('/static/vendor/examples/jsm/loaders/GLTFLoader.js');
+    const { VRMLoaderPlugin } = await import('/static/vendor/three-vrm.module.min.js');
 
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, alpha: true });
     this.renderer.setSize(this.canvas.clientWidth || innerWidth, this.canvas.clientHeight || innerHeight);

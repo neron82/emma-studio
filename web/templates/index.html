@@ -6,7 +6,7 @@
 <title>Emma Studio</title>
 <link rel="stylesheet" href="/static/studio.css?v=4">
 <script type="importmap">
-{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js"}}
+{"imports":{"three":"/static/vendor/three.module.js"}}
 </script>
 <script src="/static/js/debug-console.js?v=1"></script>
 <script src="/static/js/backchannel.js?v=1"></script>
@@ -265,7 +265,7 @@ function exitFtCall(){ stopFtCallTimer(); setFtCallUI(false); }
 let ftEngine=null;
 function initFacetimeEngine(){
   if(ftEngine){ ftEngine.attach($('vrmCanvas'), $('fbPortrait'), $('engineBadge')); return; }
-  import('/static/js/facetime-engine.js?v=3').then(m=>{
+  import('/static/js/facetime-engine.js?v=4').then(m=>{
     ftEngine=new m.FacetimeEngine();
     ftEngine.attach($('vrmCanvas'), $('fbPortrait'), $('engineBadge'));
     window._ftEngine = ftEngine;
