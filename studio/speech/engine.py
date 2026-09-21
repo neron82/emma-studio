@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from studio import config
 from studio.agent.dialog import build_system_prompt
+from studio.agent.memory import schedule_call_finalization
 from studio.core.store import Store
 from studio.deliver.realtime.emma_events import EmmaStatusEvent, EmmaVideoFrameEvent
 from studio.deliver.realtime.pipeline_unit import PipelineUnit
@@ -323,6 +324,7 @@ class EmmaRealtimeService(RealtimeService):
         self._status_lock = threading.Lock()
         self._lm_text_seen: dict[str, set[str]] = {}
         self._persona_by_conn: dict[str, str] = {}
+        self._call_session_by_conn: dict[str, str] = {}  # conn_id → DB-Call-Session
         self._last_persisted: dict[str, str] = {}
         # Visueller Kontext: Verlaufs-Zyklen (5 s) statt einer Rollen-Summary.
         # Der Analyzer-Thread füllt sie; Gates markieren Aktivität; silent
@@ -349,8 +351,38 @@ class EmmaRealtimeService(RealtimeService):
         extra = getattr(event.session, "model_extra", None) or {}
         persona_id = extra.get("persona_id")
         if isinstance(persona_id, str) and persona_id:
-            return self._apply_persona(conn_id, persona_id)
+            error = self._apply_persona(conn_id, persona_id)
+            if error is not None:
+                return error
+        # Call-Session-Bindung (extra Feld ``session_id``): alle Nachrichten dieser
+        # Verbindung werden mit der DB-Session getaggt; bei Trennung wird die
+        # Session defensiv finalisiert.
+        self._apply_call_session(conn_id, extra.get("session_id"))
         return None
+
+    def _apply_call_session(self, conn_id: str, session_id: Any) -> None:
+        """Verbindung mit einer DB-Call-Session binden (best effort).
+
+        Nur aktive Sessions derselben Persona werden gebunden; alles andere wird
+        abgelehnt und protokolliert. Die Bindung ist die Grundlage für das
+        Session-Tagging der persistierten Nachrichten und die defensive
+        Finalisierung bei Trennung.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            return
+        row = self._store.get_session(session_id)
+        if row is None:
+            logger.warning("session.update: unknown session_id %r — not bound", session_id)
+            return
+        if row["state"] != "active":
+            logger.warning("session.update: session %s is not active — not bound", session_id)
+            return
+        persona_id = self._persona_by_conn.get(conn_id)
+        if persona_id and row["persona_id"] != persona_id:
+            logger.warning("session.update: session %s belongs to another persona — not bound", session_id)
+            return
+        self._call_session_by_conn[conn_id] = session_id
+        logger.info("Connection %s bound to call session %s", conn_id, session_id)
 
     def _apply_persona(self, conn_id: str, persona_id: str) -> Optional[RealtimeErrorEvent]:
         persona = self._store.get_persona(persona_id)
@@ -378,6 +410,7 @@ class EmmaRealtimeService(RealtimeService):
         return None
 
     def unregister(self, conn_id: str) -> None:
+        self._finalize_call_session(conn_id)
         self._persona_by_conn.pop(conn_id, None)
         self._last_persisted.pop(conn_id, None)
         self._stop_analyzer(conn_id)
@@ -390,6 +423,29 @@ class EmmaRealtimeService(RealtimeService):
             self._silent_user_items.pop(key, None)
         self._vlm_warned.discard(conn_id)      # set, kein dict
         super().unregister(conn_id)
+
+    def _finalize_call_session(self, conn_id: str) -> None:
+        """Defensive Call-Finalisierung bei Verbindungstrennung (Tab zu, Crash):
+        Wenn noch eine aktive Call-Session angebunden ist, wird sie finalisiert und
+        die Memory-Aufarbeitung gestartet. Das explizite ``POST /api/calls/end``
+        hat Vorrang — der Übergangs-Guard in ``finalize_session_now`` verhindert
+        Doppel-Einträge in der Memory.
+        """
+        session_id = self._call_session_by_conn.pop(conn_id, None)
+        if not session_id:
+            return
+        try:
+            row = self._store.finalize_session_now(session_id)
+        except Exception as exc:  # noqa: BLE001 — Trennungspfad darf nicht sterben
+            log_exception(logger, "defensive session finalization failed", exc)
+            return
+        if row is None:
+            return
+        logger.info("Call %s bei Verbindungstrennung finalisiert (kein explizites Ende)", session_id)
+        try:
+            schedule_call_finalization(self._store, row)
+        except Exception as exc:  # noqa: BLE001
+            log_exception(logger, "memory scheduling failed", exc)
 
     # ── Statuszeilen für das Debug-Overlay ───────────────────────────────
 
@@ -703,6 +759,10 @@ class EmmaRealtimeService(RealtimeService):
 
     # ── per-turn RAG + user persistence ──────────────────────────────────
 
+    def _call_session_id(self, conn_id: str) -> str | None:
+        """Aktive DB-Call-Session der Verbindung (sonst ``None``)."""
+        return self._call_session_by_conn.get(conn_id)
+
     def _on_transcription_completed(self, conn_id: str, event) -> list:
         persona_id = self._persona_by_conn.get(conn_id)
         transcript = (event.transcript or "").strip()
@@ -712,7 +772,7 @@ class EmmaRealtimeService(RealtimeService):
         if persona_id and transcript:
             self._status("STT", f"final: {transcript[:90]}", None)
             try:
-                self._store.add_message(persona_id, "user", transcript)
+                self._store.add_message(persona_id, "user", transcript, session_id=self._call_session_id(conn_id))
             except Exception as exc:
                 log_exception(logger, "user message persist failed", exc)
         return events
@@ -730,7 +790,7 @@ class EmmaRealtimeService(RealtimeService):
         if persona_id and text:
             self._refresh_instructions(conn_id, persona_id, text)
             try:
-                self._store.add_message(persona_id, "user", text)
+                self._store.add_message(persona_id, "user", text, session_id=self._call_session_id(conn_id))
             except Exception as exc:
                 log_exception(logger, "user message persist failed", exc)
         return events
@@ -798,7 +858,7 @@ class EmmaRealtimeService(RealtimeService):
             if not text or self._last_persisted.get(conn_id) == text:
                 return
             self._last_persisted[conn_id] = text
-            self._store.add_message(persona_id, "assistant", text)
+            self._store.add_message(persona_id, "assistant", text, session_id=self._call_session_id(conn_id))
         except Exception as exc:
             log_exception(logger, "assistant message persist failed", exc)
 

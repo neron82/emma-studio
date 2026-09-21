@@ -14,6 +14,8 @@ const CallSession = (() => {
   // ---- state ----
   let micOn = false;            // explicit toggle state
   let handsfree = false;        // auto-conversation mode flag (UI status text)
+  let callSessionId = null;     // active facetime call session (server-side)
+  let muted = false;            // mic muted during a call (WS stays open)
   let speaking = false;         // response audio playing
   let ws = null, wsReady = false, intentionalClose = false;
   let mediaStream = null, micSrc = null, micNode = null;
@@ -133,6 +135,7 @@ const CallSession = (() => {
       session: {
         type: 'realtime',
         persona_id: personaId,
+        session_id: callSessionId,   // active facetime call (null when no call)
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         turn_detection: { type: 'server_vad', interrupt_response: true, create_response: true },
@@ -184,7 +187,11 @@ const CallSession = (() => {
     setVisemes(null);
     if (wasLive) emit({ type: 'handsfree', on: false });
     emit({ type: 'mic', on: false });
-    emit({ type: 'error', error: 'Realtime-Verbindung getrennt' });
+    if (callSessionId) {
+      const lost = callSessionId;
+      callSessionId = null; muted = false;
+      emit({ type: 'call-end', id: lost });   // server finalized via teardown path
+    }
   }
 
   function closeWs() {
@@ -512,7 +519,7 @@ const CallSession = (() => {
 
   /** Int16 PCM chunk from the worklet → base64 → input_audio_buffer.append. */
   function onMicChunk(buf) {
-    if (!wsReady || !micOn) return;   // gated by the worklet enable flag
+    if (!wsReady || !micOn || muted) return;   // gated by the worklet enable flag + Mute
     send({ type: 'input_audio_buffer.append', audio: base64FromArrayBuffer(buf) });
   }
 
@@ -657,12 +664,85 @@ const CallSession = (() => {
   function isHandsfree() { return handsfree; }
   function isBusy() { return speaking; }
 
+  // ================= FACETIME CALL (Call / Hang-up / Mute) =================
+
+  /** Start a facetime call: create the server session first, then bring up
+      mic + WebSocket exactly like the old handsfree flow. */
+  async function startCall() {
+    if (callSessionId) return;
+    try { await acquireMic(); } catch { return; }  // getUserMedia already emitted the error
+    let session;
+    try {
+      const res = await fetch('/api/calls/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ persona_id: personaId }),
+      });
+      if (!res.ok) {
+        let detail = `Call-Start fehlgeschlagen (HTTP ${res.status})`;
+        try { const j = await res.json(); if (j.detail) detail = j.detail; } catch {}
+        await setMic(false);         // Mic war schon aktiv — wieder runter
+        emit({ type: 'error', error: detail });
+        return;
+      }
+      session = await res.json();
+    } catch (e) {
+      await setMic(false);           // gleicher Cleanup bei Netzwerkfehler
+      emit({ type: 'error', error: 'Call-Start fehlgeschlagen: ' + e.message });
+      return;
+    }
+    callSessionId = session.id;
+    muted = false;
+    micOn = true;           // mic stays up for the whole call (Mute is separate)
+    handsfree = true;       // auto-conversation for the whole call
+    emit({ type: 'call-start', id: callSessionId, at: Date.now() });
+    const hadWs = !!ws;
+    await connect();
+    if (hadWs && ws) sendSessionUpdate('Call-Start');   // rebind session_id on reuse
+    if (wsReady) micNode.port.postMessage({ kind: 'enable', value: true });
+  }
+
+  /** Hang up: finalize the server session, then tear down mic + WS. */
+  async function endCall() {
+    const id = callSessionId;
+    if (!id) return;
+    callSessionId = null;
+    muted = false;
+    emit({ type: 'call-end', id });
+    // Server finalizes (idempotent — the WS-teardown path does the same when
+    // the tab dies first); post-call summarization then runs in the background.
+    try {
+      await fetch('/api/calls/end', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: id }),
+      });
+    } catch {}
+    micOn = false;
+    handsfree = false;
+    stopFrameLoop();
+    hidePip();
+    if (pipVideo) pipVideo.srcObject = null;
+    videoEl.srcObject = null;
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    micSrc = null;
+    flushPlaybackBuffer();
+    clockActive = false;
+    closeWs();
+  }
+
+  /** Mute: stop streaming mic audio, the call itself stays alive (FaceTime). */
+  function setMuted(m) {
+    muted = !!m;
+    emit({ type: 'mute', on: muted });
+  }
+  function isMuted() { return muted; }
+
   return {
     setPersona, setMic, toggleMic, isMicOn,
     setHandsfree, isHandsfree, isBusy,
+    startCall, endCall, setMuted, isMuted,
     pushText, flushQueue, playbackClock, setLogSink,
     set callback(fn) { onEvent = fn; },
-    get state() { return { micOn, handsfree, speaking, connected: wsReady }; },
+    get state() { return { micOn, handsfree, speaking, connected: wsReady, callActive: !!callSessionId, muted }; },
   };
 })();
 

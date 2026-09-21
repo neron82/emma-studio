@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 
 from .. import config
+from .memory import load_memory
 
 
 class AgentError(RuntimeError):
@@ -19,6 +20,13 @@ class AgentError(RuntimeError):
 def build_system_prompt(persona: dict, facts: list[dict], search_results: list[dict] | None = None) -> str:
     parts = [persona["personality_prompt"].strip() or "You are a friendly assistant."]
     parts.append(f"You speak {persona.get('language') or 'German'}.")
+    # Langer Kontext über Calls hinweg: eine Memory-Datei pro Persona, gefüllt
+    # mit dichten Call-Zusammenfassungen (eine pro abgeschlossener Call).
+    memory_text = load_memory(persona["id"]) if persona.get("id") else ""
+    if memory_text:
+        parts.append(
+            "Long-term memory from previous calls (trust it as context):\n" + memory_text
+        )
     if facts:
         lines = "\n".join(f"- {f['fact']}" for f in facts)
         parts.append(f"Known facts about the user (trust these):\n{lines}")

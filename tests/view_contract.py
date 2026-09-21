@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 VIEWS = {
-    "facetime": ["ftMsg", "ftMic", "engineBadge", "vrmCanvas", "ftHf", "chatLog"],
+    "facetime": ["ftMsg", "ftCall", "ftMute", "ftHangup", "engineBadge", "vrmCanvas", "chatLog"],
     "call": ["micBtn2", "handsfreeBtn", "hangupBtn", "callMsg", "callStatus", "chatLog", "txToggle"],
     "videos": ["vidTopic", "vidMode", "vidGo", "vidGrid"],
     "personas": ["pPrompt", "pLang", "pVoiceProfile", "npName"],

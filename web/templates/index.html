@@ -209,6 +209,7 @@ function renderFacetime(){
         </div>
       </div>
       <div class="call-status" id="ftStatus">Bereit</div>
+      <div class="call-timer hidden" id="ftTimer">00:00</div>
 
       <div class="transcript-fab">
         <button class="icon-btn" id="txToggleFt" title="Transkript">📄</button>
@@ -217,17 +218,49 @@ function renderFacetime(){
         </div>
       </div>
 
-      <div class="facetime-panel composer">
-          <button class="mic-btn" id="ftMic" title="Mikrofon an/aus">🎙️</button>
-          <button class="call-btn big accent small-in-composer" id="ftHf" title="Handsfree">📞</button>
+        <div class="ft-callbar" id="ftCallBar">
+          <button class="ft-btn call" id="ftCall" title="Anrufen"><span>📞</span></button>
+          <button class="ft-btn mute hidden" id="ftMute" title="Stummschalten"><span>🎙️</span></button>
+          <button class="ft-btn hangup hidden" id="ftHangup" title="Auflegen"><span>📞</span></button>
+        </div>
+        <div class="composer">
           <input type="text" id="ftMsg" placeholder="sag etwas… (Enter)">
           <button class="btn" id="ftSend">Senden</button>
+        </div>
       </div>
     </div>`;
   initFacetimeEngine();
   bindCallEngine('facetime');
   $('ftSend').onclick=()=>{ const t=$('ftMsg').value.trim(); if(t){$('ftMsg').value=''; revealFtAvatar(); CallSession.pushText(t);} };
 }
+
+/* ================= Facetime call bar (Call / Mute / Hang-up) ================= */
+let ftCallTimerId=null;
+function setFtCallUI(inCall){
+  const call=$('ftCall'), mute=$('ftMute'), hangup=$('ftHangup'), timer=$('ftTimer');
+  if(!call) return;
+  call.classList.toggle('hidden', inCall);
+  mute.classList.toggle('hidden', !inCall);
+  hangup.classList.toggle('hidden', !inCall);
+  if(timer) timer.classList.toggle('hidden', !inCall);
+  if(mute) mute.classList.remove('muted');
+}
+function ftCallTimer(startedAt){
+  stopFtCallTimer();
+  const t0 = startedAt || Date.now();
+  const el = $('ftTimer');
+  const tick=()=>{
+    if(!CallSession.state.callActive) return;
+    const s=Math.max(0, Math.floor((Date.now()-t0)/1000));
+    const mm=String(Math.floor(s/60)).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
+    if(el) el.textContent = mm+':'+ss;
+  };
+  tick(); ftCallTimerId=setInterval(tick,1000);
+}
+function stopFtCallTimer(){ if(ftCallTimerId){ clearInterval(ftCallTimerId); ftCallTimerId=null; } }
+/** enterFtCall/exitFtCall: thin aliases so the event switch stays readable. */
+function enterFtCall(at){ setFtCallUI(true); ftCallTimer(at); }
+function exitFtCall(){ stopFtCallTimer(); setFtCallUI(false); }
 
 let ftEngine=null;
 function initFacetimeEngine(){
@@ -297,13 +330,25 @@ function bindCallEngine(mode){
     if (!st && mode!=='facetime') return;
     switch(ev.type){
       case 'mic': {
-        const b = $(mode==='facetime'?'ftMic':'micBtn2');
+        const b = $(mode==='facetime'?'ftMute':'micBtn2');
         if(b){ b.classList.toggle('on', ev.on); b.classList.toggle('off', !ev.on); }
         if(mode==='facetime' && ev.on) revealFtAvatar();
         setStatus(st, ev.on ? 'Mikro an' : 'Mikro aus'); break;
       }
+      case 'mute': {
+        const b = $(mode==='facetime'?'ftMute':null);
+        if(b){ b.classList.toggle('on', ev.on); b.classList.toggle('off', !ev.on); }
+        if(mode==='facetime') setStatus(st, ev.on ? '🔇 stumm' : 'Mikro an');
+        break;
+      }
       case 'handsfree':
         if(mode==='facetime' && ev.on) revealFtAvatar();
+        break;
+      case 'call-start':
+        if(mode==='facetime'){ enterFtCall(ev.at); revealFtAvatar(); }
+        break;
+      case 'call-end':
+        if(mode==='facetime') exitFtCall();
         break;
       case 'listening':
         if(mode==='facetime') revealFtAvatar();
@@ -351,22 +396,24 @@ function bindCallEngine(mode){
   }).catch(()=>{});
 
   // controls
-  const micB = $(mode==='facetime'?'ftMic':'micBtn2');
+  const micB = $(mode==='facetime'?null:'micBtn2');
   if(micB) micB.onclick = async () => { await CallSession.toggleMic(); };
-  const hfB = $(mode==='facetime'?'ftHf':'handsfreeBtn');
+  const hfB = $(mode==='facetime'?null:'handsfreeBtn');
   if(hfB) hfB.onclick = () => {
     const on = !CallSession.isHandsfree();
     CallSession.setHandsfree(on);
     hfB.classList.toggle('active', on);
     if(on && !CallSession.isMicOn()) CallSession.toggleMic();
   };
-  const huB = $(mode==='facetime'?null:'hangupBtn');
-  if(huB) huB.onclick = () => {
-    CallSession.flushQueue();
-    CallSession.setHandsfree(false);
-    CallSession.setMic(false);
-    if(hfB) hfB.classList.remove('active');
+  // facetime: Call / Mute / Hang-up (replaces old mic+handsfree buttons)
+  const ftCallB = $('ftCall'), ftMuteB = $('ftMute'), ftHangupB = $('ftHangup');
+  if(ftCallB) ftCallB.onclick = async () => {
+    if(CallSession.state.callActive) return;
+    setStatus($('ftStatus'), 'Verbinde…');
+    await CallSession.startCall();
   };
+  if(ftMuteB) ftMuteB.onclick = () => CallSession.setMuted(!CallSession.isMuted());
+  if(ftHangupB) ftHangupB.onclick = async () => { stopFtCallTimer(); await CallSession.endCall(); };
   const input = $(mode==='facetime'?'ftMsg':'callMsg');
   if(input) input.addEventListener('keydown', e=>{
     if(e.key==='Enter' && input.value.trim()){ const t=input.value.trim(); input.value=''; if(mode==='facetime') revealFtAvatar(); CallSession.pushText(t); }

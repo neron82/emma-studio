@@ -414,6 +414,24 @@ class Store:
         self.conn.commit()
         return self.get_session(session_id)
 
+    def finalize_session_now(self, session_id: str) -> dict | None:
+        """Transition an active session to finalized.
+
+        Returns the row only when this call performed the transition (so callers
+        can schedule post-call work exactly once); returns None otherwise.
+        """
+        row = self.get_session(session_id)
+        if row is None or row["state"] != "active":
+            return None
+        cur = self.conn.execute(
+            "UPDATE sessions SET state='finalized', ended_at=? WHERE id=? AND state='active'",
+            (_now(), session_id),
+        )
+        if cur.rowcount != 1:
+            return None  # der andere Finalisierer war zuerst
+        self.conn.commit()
+        return self.get_session(session_id)
+
     def set_session_summary(self, session_id: str, summary: str) -> dict | None:
         self.conn.execute("UPDATE sessions SET summary=? WHERE id=?", (summary, session_id))
         self.conn.commit()

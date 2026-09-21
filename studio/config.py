@@ -22,6 +22,11 @@ LLM_BASE_URL = os.getenv("STUDIO_LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = os.getenv("STUDIO_LLM_MODEL", "stealth/ox-alpha")
 LLM_API_KEY = os.getenv("STUDIO_LLM_API_KEY", "")
 
+# --- Memory (per-persona call summaries in memory.md) -----------------------
+# Hard word limit for a persona's long-term memory; the oldest entry is dropped
+# before a new one is appended once the file exceeds this.
+MEMORY_MAX_WORDS = int(os.getenv("STUDIO_MEMORY_MAX_WORDS", "10000"))
+
 # --- Speech -----------------------------------------------------------------
 OMNIVOICE_URL = os.getenv("STUDIO_OMNIVOICE_URL", "http://127.0.0.1:8880")
 STT_MODEL = os.getenv("STUDIO_STT_MODEL", "large-v3-turbo")  # proven chatbot config

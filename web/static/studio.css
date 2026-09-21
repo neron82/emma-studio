@@ -437,3 +437,26 @@ body.pipe-open #camPip { bottom: calc(28vh + 16px); }
 .pipe-log .st.PLAY  { color: #79c0ff; }
 .pipe-log .txt { flex: 1; color: var(--text); }
 .pipe-log .empty { color: var(--text-faint); }
+
+/* ---------- Facetime call bar (idle: dial · in-call: mute + hangup) ---------- */
+.hidden { display: none !important; }
+.call-timer { font-size: 13px; color: var(--text-dim); letter-spacing: .08em; min-height: 1.2em; z-index: 2; }
+.ft-callbar { display: flex; align-items: center; justify-content: center; gap: 22px; padding: 6px 0 2px; z-index: 2; }
+.ft-btn {
+  width: 64px; height: 64px; border-radius: 50%;
+  border: none; cursor: pointer; font-size: 26px;
+  display: grid; place-items: center; color: #fff;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  transition: transform .12s ease, filter .12s ease, opacity .2s ease;
+}
+.ft-btn span { display: inline-block; line-height: 1; }
+.ft-btn:hover { transform: scale(1.07); }
+.ft-btn:active { transform: scale(.96); }
+.ft-btn.call { background: #28cd41; }
+.ft-btn.call:hover { background: #37e055; }
+.ft-btn.mute { background: rgba(255,255,255,.16); }
+.ft-btn.mute.muted { filter: brightness(.7); }
+.ft-btn.mute.muted span { opacity: .6; }
+.ft-btn.hangup { background: #ff3b30; }
+.ft-btn.hangup:hover { background: #ff5449; }
+.ft-btn.hangup span { transform: rotate(135deg); }

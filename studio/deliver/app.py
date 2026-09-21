@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import config
 from ..core.store import Store
+from ..agent.memory import schedule_call_finalization
 from ..core import pipeline
 from ..speech import engine
 from .realtime.websocket_router import register_realtime
@@ -316,6 +317,46 @@ async def delete_fact(fact_id: str):
         raise HTTPException(404, "fact not found")
     return {"ok": True}
 
+
+# -- calls (facetime call sessions) ------------------------------------------
+
+@app.post("/api/calls/start")
+async def start_call(payload: dict):
+    """Neuen Facetime-Call starten: Session, die alle ihre Messages taggt."""
+    persona_id = payload.get("persona_id")
+    if not persona_id or store.get_persona(persona_id) is None:
+        raise HTTPException(400, "unknown persona_id")
+    for session in store.list_sessions(persona_id=persona_id, limit=50):
+        if session["state"] == "active":
+            raise HTTPException(409, {"detail": "persona already has an active call", "session": session})
+    return store.create_session(persona_id)
+
+
+@app.post("/api/calls/end")
+async def end_call(payload: dict):
+    """Auflegen: Session finalisieren + Memory-Zusammenfassung planen (exakt einmal)."""
+    session = store.get_session(str(payload.get("session_id", "")))
+    if session is None:
+        raise HTTPException(404, "unknown session_id")
+    row = store.finalize_session_now(session["id"])
+    if row is not None:
+        schedule_call_finalization(store, row)
+    return store.get_session(session["id"])
+
+
+@app.get("/api/sessions")
+async def list_sessions(persona_id: str | None = None, limit: int = 50):
+    """Call-Sessions (neueste zuerst), optional nach Persona gefiltert."""
+    return store.list_sessions(persona_id=persona_id, limit=limit)
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Session inkl. Transcript (User + Avatar, ohne VLM-Beschreibungen)."""
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session_id")
+    return {"session": session, "messages": store.session_transcript(session_id)}
 
 def main() -> None:
     import uvicorn
