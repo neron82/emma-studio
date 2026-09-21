@@ -22,16 +22,20 @@ export class FacetimeEngine {
     this.renderer = null; this.scene = null; this.camera = null;
     this.canvas = null; this.fbEl = null; this.badgeEl = null;
     this.running = false;
+    this.dead = false;            // shutdown() während init/Retry: Abbruch-Marker
+    this._initPending = false; this._retryTimer = null; this._breath = null;
   }
 
   attach(canvas, fallbackEl, badgeEl) {
     this.canvas = canvas; this.fbEl = fallbackEl; this.badgeEl = badgeEl;
     if (this.running || this._initPending) return;   // laufende (Re-)Initialisierung übernehmen
+    this.dead = false;                                // frischer Start nach shutdown()
     this._initPending = true;
     const attempt = async (n) => {
       try {
         await this.init();
       } catch (e) {
+        if (this.dead) return;                        // shutdown während init — abbrechen
         console.error('[facetime] init failed:', e);
         // View gewechselt? Dann abbrechen — das nächste attach() startet frisch.
         if (!this.canvas.isConnected) { this._initPending = false; return; }
@@ -42,10 +46,26 @@ export class FacetimeEngine {
         }
         const delay = [2000, 5000, 10000][n];
         if (this.badgeEl) this.badgeEl.textContent = `Neu laden (${n + 1}/3)…`;
-        setTimeout(() => attempt(n + 1), delay);
+        this._retryTimer = setTimeout(() => attempt(n + 1), delay);
       }
     };
     attempt(0);
+  }
+
+  /** Stoppt Render-Loop und (laufende) Initialisierung und gibt die
+      GPU-Ressourcen frei. Ein späteres attach() startet von vorn. */
+  shutdown() {
+    this.dead = true;
+    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+    if (this._breath) { clearInterval(this._breath); this._breath = null; }
+    this._initPending = false;
+    this.running = false;                              // loop() bricht ab
+    if (this.renderer) {
+      try { this.renderer.dispose(); } catch {}
+      try { this.renderer.forceContextLoss(); } catch {}   // GPU-Speicher wirklich freigeben
+      this.renderer = null;
+    }
+    this.vrm = null; this.scene = null; this.camera = null;
   }
 
   showFallback(reason) {
@@ -54,7 +74,8 @@ export class FacetimeEngine {
     // gentle breathing on the still portrait
     const img = this.fbEl && this.fbEl.querySelector('img');
     if (img) { let t = 0;
-      setInterval(() => { t += .05; img.style.transform = `scale(${1 + Math.sin(t) * .008})`; }, 50);
+      clearInterval(this._breath);
+      this._breath = setInterval(() => { t += .05; img.style.transform = `scale(${1 + Math.sin(t) * .008})`; }, 50);
     }
   }
 
@@ -62,6 +83,7 @@ export class FacetimeEngine {
     const THREE = await import('/static/vendor/three.module.js');
     const { GLTFLoader } = await import('/static/vendor/examples/jsm/loaders/GLTFLoader.js');
     const { VRMLoaderPlugin } = await import('/static/vendor/three-vrm.module.min.js');
+    if (this.dead) return;                        // shutdown während Import — abbrechen
 
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, alpha: true });
     this.renderer.setSize(this.canvas.clientWidth || innerWidth, this.canvas.clientHeight || innerHeight);
@@ -154,6 +176,7 @@ export class FacetimeEngine {
     if (this.fbEl) this.fbEl.style.display = 'none';
     this.THREE = THREE;
     this._initGaze(this._facingPlusZ);   // Kopf/Augen auf die Kamera ausrichten
+    if (this.dead) { this._initPending = false; return; }   // shutdown während VRM-Download
     this.running = true;
     this.loop();
   }
@@ -445,6 +468,7 @@ export class FacetimeEngine {
 }
 
 FacetimeEngine.prototype.loop = function () {
+  if (!this.running) return;
   requestAnimationFrame(() => this.loop());
   const vrm = this.vrm;
   if (vrm) {

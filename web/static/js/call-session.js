@@ -16,6 +16,7 @@ const CallSession = (() => {
   let handsfree = false;        // auto-conversation mode flag (UI status text)
   let callSessionId = null;     // active facetime call session (server-side)
   let muted = false;            // mic muted during a call (WS stays open)
+  let videoWanted = false;      // Video-Modus aktiv (Kamera läuft)
   let speaking = false;         // response audio playing
   let ws = null, wsReady = false, intentionalClose = false;
   let mediaStream = null, micSrc = null, micNode = null;
@@ -481,27 +482,12 @@ const CallSession = (() => {
     try {
       // echoCancellation keeps Emma's own TTS out of the mic — critical for
       // handsfree barge-in (proven chatbot config).
-      // Video kommt dazu (VLM-Blickkontext). Verweigert der Nutzer die Kamera
-      // oder fehlt sie, läuft der Call unverändert audio-only weiter.
       const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
-      try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio, video: { width: { ideal: 640 }, height: { ideal: 480 } },
-        });
-        window.DebugConsole && DebugConsole.ok('Mikrofon + Kamera freigeschaltet');
-      } catch (videoErr) {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio });
-        window.DebugConsole && DebugConsole.ok(
-          `Mikrofon freigeschaltet (ohne Kamera: ${videoErr.name}) — Blickkontext aus`);
-      }
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio });
+      window.DebugConsole && DebugConsole.ok('Mikrofon freigeschaltet');
     } catch (e) {
       window.DebugConsole && DebugConsole.error('getUserMedia fehlgeschlagen: ' + e.name);
       throw e;
-    }
-    if (hasVideo()) {
-      videoEl.srcObject = mediaStream;
-      videoEl.play().catch(() => {});
-      showPip();                       // Vorschau: was Emma sieht
     }
     await ensureAudioCtx();
     if (micSrc) { try { micSrc.disconnect(); } catch {} }
@@ -527,6 +513,44 @@ const CallSession = (() => {
 
   function hasVideo() {
     return !!(mediaStream && mediaStream.getVideoTracks().some(t => t.readyState === 'live'));
+  }
+
+  /** Video-Modus AN: Kamera dazuschalten (VLM-Blickkontext). Unabhängig vom
+      Call-Status, idempotent — liefert true, wenn die Kamera schon läuft. */
+  async function enableVideo() {
+    if (!mediaStream) return false;              // erst Mikro/Call, dann Kamera
+    if (hasVideo()) return true;
+    videoWanted = true;
+    try {
+      const v = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      // disableVideo() während der Berechtigungsanfrage — nicht mehr erwünscht
+      if (!videoWanted || !mediaStream) { v.getTracks().forEach(t => t.stop()); return false; }
+      mediaStream.addTrack(v.getVideoTracks()[0]);
+      videoEl.srcObject = mediaStream;
+      videoEl.play().catch(() => {});
+      showPip();                                  // Vorschau: was Emma sieht
+      startFrameLoop();
+      window.DebugConsole && DebugConsole.ok('Kamera aktiv — Blickkontext an');
+      return true;
+    } catch (e) {
+      videoWanted = false;
+      emit({ type: 'error', error: 'Kamera nicht verfügbar: ' + e.name });
+      return false;
+    }
+  }
+
+  /** Video-Modus AUS: Kamera-Tracks stoppen, der Call bleibt aktiv. */
+  function disableVideo() {
+    videoWanted = false;
+    if (!hasVideo()) return;
+    stopFrameLoop();
+    hidePip();
+    if (pipVideo) pipVideo.srcObject = null;
+    mediaStream.getVideoTracks().forEach(t => t.stop());
+    videoEl.srcObject = null;
+    window.DebugConsole && DebugConsole.ok('Kamera deaktiviert — Audio-only');
   }
 
   /** Kleine Vorschau: zeigt, was Emma gerade zu sehen bekommt.
@@ -602,6 +626,7 @@ const CallSession = (() => {
     } else {
       if (micNode) micNode.port.postMessage({ kind: 'enable', value: false });
       stopFrameLoop();
+      videoWanted = false;
       hidePip();
       if (pipVideo) pipVideo.srcObject = null;
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
@@ -673,9 +698,9 @@ const CallSession = (() => {
   /** Start a facetime call: create the server session first, then bring up
       mic + WebSocket exactly like the old handsfree flow. */
   async function startCall() {
-    if (callSessionId) return;
-    try { await acquireMic(); } catch { return; }  // getUserMedia already emitted the error
+    if (callSessionId) return true;
     let session;
+    try { await acquireMic(); } catch { return false; }  // getUserMedia already emitted the error
     try {
       const res = await fetch('/api/calls/start', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -686,13 +711,13 @@ const CallSession = (() => {
         try { const j = await res.json(); if (j.detail) detail = j.detail; } catch {}
         await setMic(false);         // Mic war schon aktiv — wieder runter
         emit({ type: 'error', error: detail });
-        return;
+        return false;
       }
       session = await res.json();
     } catch (e) {
       await setMic(false);           // gleicher Cleanup bei Netzwerkfehler
       emit({ type: 'error', error: 'Call-Start fehlgeschlagen: ' + e.message });
-      return;
+      return false;
     }
     callSessionId = session.id;
     muted = false;
@@ -703,6 +728,7 @@ const CallSession = (() => {
     await connect();
     if (hadWs && ws) sendSessionUpdate('Call-Start');   // rebind session_id on reuse
     if (wsReady) micNode.port.postMessage({ kind: 'enable', value: true });
+    return true;
   }
 
   /** Hang up: close the WS first (server drain persists the last reply), then
@@ -711,6 +737,7 @@ const CallSession = (() => {
     const id = callSessionId;
     if (!id) return;
     callSessionId = null;
+    videoWanted = false;
     muted = false;
     emit({ type: 'mic', on: false });   // Mute-Button synchron halten
     closeWs();                          // Server-Drain vor dem /end-Request triggern
@@ -748,8 +775,9 @@ const CallSession = (() => {
     setHandsfree, isHandsfree, isBusy,
     startCall, endCall, setMuted, isMuted,
     pushText, flushQueue, playbackClock, setLogSink,
+    hasVideo, enableVideo, disableVideo,
     set callback(fn) { onEvent = fn; },
-    get state() { return { micOn, handsfree, speaking, connected: wsReady, callActive: !!callSessionId, muted }; },
+    get state() { return { micOn, handsfree, speaking, connected: wsReady, callActive: !!callSessionId, muted, videoOn: hasVideo() }; },
   };
 })();
 
