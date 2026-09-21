@@ -5,6 +5,7 @@ Uses Chrome headless with --dump-dom on each hash URL and asserts the
 rendered DOM contains the view's key element ids.
 """
 import json
+import os
 import subprocess
 import sys
 
@@ -16,13 +17,13 @@ VIEWS = {
     "facts": ["factNew", "factQ", "factList"],
 }
 
-BASE = "http://127.0.0.1:8890/#"
+BASE = os.environ.get("STUDIO_BASE_URL", "https://127.0.0.1:8890/#")
 failures = []
 
 for view, ids in VIEWS.items():
     dom = subprocess.run(
         ["google-chrome", "--headless=new", "--disable-gpu", "--no-sandbox",
-         "--virtual-time-budget=5000", "--dump-dom", BASE + view],
+         "--ignore-certificate-errors", "--virtual-time-budget=5000", "--dump-dom", BASE + view],
         capture_output=True, text=True, timeout=60,
     ).stdout
     missing = [i for i in ids if f'id="{i}"' not in dom]
