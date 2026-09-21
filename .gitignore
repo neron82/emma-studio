@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets & machine-specific state (see README: regenerate with mkcert)
+.env
+certs/
+
+# Runtime data: DB, job outputs, generated memory (created at runtime)
+data/
+
+# Logs
+*.log

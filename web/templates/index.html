@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emma Studio</title>
+<link rel="stylesheet" href="/static/studio.css?v=4">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js"}}
+</script>
+<script src="/static/js/debug-console.js?v=1"></script>
+<script src="/static/js/backchannel.js?v=1"></script>
+<script src="/static/js/call-session.js?v=6"></script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎭</text></svg>">
+</head>
+<body>
+<div class="shell">
+
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-dot">E</div><span>Emma <em>Studio</em></span></div>
+
+    <nav class="nav-section">
+      <div class="nav-label">Kommunikation</div>
+      <button class="nav-item" data-view="facetime" onclick="go('facetime')"><span class="ico">🎥</span><span class="lbl">Facetime</span></button>
+      <button class="nav-item" data-view="call" onclick="go('call')"><span class="ico">📞</span><span class="lbl">Telefonat</span></button>
+      <button class="nav-item" data-view="videos" onclick="go('videos')"><span class="ico">🎬</span><span class="lbl">Video-Post</span></button>
+    </nav>
+
+    <nav class="nav-section">
+      <div class="nav-label">Studio</div>
+      <button class="nav-item" data-view="personas" onclick="go('personas')"><span class="ico">🧝‍♀️</span><span class="lbl">Personas</span></button>
+      <button class="nav-item" data-view="facts" onclick="go('facts')"><span class="ico">🧠</span><span class="lbl">Wissen</span></button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="svc-row"><div class="svc-dot" id="svc-omni"></div><span class="nm">OmniVoice</span></div>
+      <div class="svc-row"><div class="svc-dot" id="svc-comfy"></div><span class="nm">ComfyUI</span></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h2 id="viewTitle">Facetime</h2>
+      <div class="persona-chip">
+        <button class="icon-btn" id="pipeToggle" title="Pipeline-Status (Alt+P)">📊</button>
+        <img class="persona-avatar" id="topAvatar" src="/api/personas/portrait" onerror="this.style.visibility='hidden'">
+        <select id="persona" style="width:auto;background:none;border:none;color:var(--text);font:inherit;padding:0" onchange="onPersonaSwitch()"></select>
+      </div>
+    </header>
+
+    <div class="content">
+      <div class="view" id="view"></div>
+    </div>
+  </div>
+
+</div>
+<div id="toast"></div>
+
+<!-- Pipeline-Status: zeigt durchlaufend, welcher Teil gerade arbeitet -->
+<div id="pipeOverlay">
+  <div class="pipe-head">
+    <b>Pipeline-Status</b>
+    <span class="muted" id="pipeCount">0 Zeilen</span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="pipeClear" title="Leeren">🧹</button>
+    <button class="icon-btn" id="pipeClose" title="Schließen (Alt+P)">✕</button>
+  </div>
+  <div class="pipe-log" id="pipeLog"><div class="ln empty">Noch keine Meldungen.</div></div>
+</div>
+<audio id="audioOut" style="display:none"></audio>
+
+<script>
+/* ================= app shell ================= */
+const $ = id => document.getElementById(id);
+let personas = [], currentView = null, personaId = null;
+
+const VIEWS = {
+  facetime: {title:'Facetime', render: renderFacetime},
+  call:     {title:'Telefonat', render: renderCall},
+  videos:   {title:'Video-Post', render: renderVideos},
+  personas: {title:'Personas', render: renderPersonas},
+  facts:    {title:'Wissen', render: renderFacts},
+};
+
+function toast(msg, isErr){
+  const t=$('toast'); t.textContent=msg; t.classList.toggle('error',!!isErr); t.classList.add('show');
+  clearTimeout(t._to); t._to=setTimeout(()=>t.classList.remove('show'), 2600);
+}
+async function api(path, opts){ const r=await fetch(path,opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+
+function go(view){
+  if(!VIEWS[view]) view='facetime';
+  currentView=view;
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active', n.dataset.view===view));
+  $('viewTitle').textContent=VIEWS[view].title;
+  VIEWS[view].render();
+  history.replaceState(null,'','#'+view);
+}
+
+function onPersonaSwitch(){
+  personaId=$('persona').value;
+  localStorage.setItem('studioPersona', personaId);
+  if(currentView) VIEWS[currentView].render();
+}
+
+function currentPersona(){ return personas.find(p=>p.id===personaId); }
+
+/* ================= pipeline status overlay ================= */
+/* Zeigt durchlaufend, welcher Teil der Pipeline arbeitet. Quellen:
+   (1) Server-Statuszeilen (emma.status → VLM/STT/PROMPT/LM/TTS/RESP) und
+   (2) die Client-Meldungen aus CallSession (Mikrofon, Frames, Playback …). */
+const PipeLog = (() => {
+  const MAX = 400;
+  const box = $('pipeLog'), overlay = $('pipeOverlay'), counter = $('pipeCount');
+  let lines = 0;
+
+  function stageOf(msg) {
+    const m = /^\[([A-ZÄÖÜ]+)\]/.exec(msg) || /^([A-Z]{2,6})\b/.exec(msg);
+    return m ? m[1] : '';
+  }
+
+  function add(msg) {
+    if (!box) return;
+    if (lines === 0) box.innerHTML = '';
+    const st = stageOf(msg);
+    const el = document.createElement('div');
+    el.className = 'ln';
+    const nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+    el.innerHTML = `<span class="ts"></span><span class="st ${st}"></span><span class="txt"></span>`;
+    el.children[0].textContent = new Date().toLocaleTimeString('de-DE');
+    el.children[1].textContent = st || '·';
+    el.children[2].textContent = st ? msg.replace(/^\[[A-ZÄÖÜ]+\]\s*/, '') : msg;
+    box.appendChild(el);
+    lines++;
+    while (box.children.length > MAX) box.removeChild(box.firstChild);
+    if (counter) counter.textContent = lines + ' Zeilen';
+    if (nearBottom || lines < 3) box.scrollTop = box.scrollHeight;
+  }
+
+  function toggle(force) {
+    const open = force !== undefined ? force : !overlay.classList.contains('open');
+    overlay.classList.toggle('open', open);
+    document.body.classList.toggle('pipe-open', open);
+    if (open) box.scrollTop = box.scrollHeight;
+  }
+
+  window.addEventListener('keydown', e => {
+    if (e.altKey && (e.key === 'p' || e.key === 'P')) { e.preventDefault(); toggle(); }
+  });
+  $('pipeToggle').onclick = () => toggle();
+  $('pipeClose').onclick = () => toggle(false);
+  $('pipeClear').onclick = () => { lines = 0; box.innerHTML = '<div class="ln empty">geleert</div>'; if (counter) counter.textContent = '0 Zeilen'; };
+
+  return { add, toggle };
+})();
+
+// CallSession meldet hier ihre Client-Ereignisse (Mikrofon, Frames, Playback …)
+if (window.CallSession && CallSession.setLogSink) CallSession.setLogSink(msg => PipeLog.add(msg));
+
+/* ================= shared helpers ================= */
+function statusPill(state){
+  const cls = state==='done'?'done':state==='failed'?'failed':'running';
+  return `<span class="status-pill ${cls}">${state}</span>`;
+}
+function pollJob(id, cb, interval=1800){
+  const tick=async()=>{
+    const j=await api('/api/jobs/'+id);
+    cb(j);
+    if(!['done','failed'].includes(j.state)) setTimeout(tick, interval);
+  };
+  tick();
+}
+function playChunksSequential(chunks, el){
+  Backchannel.cancel();  // race guard: answer wins over filler
+  return new Promise(async res=>{
+    if(!chunks.length) return res();
+    for(const c of chunks){
+      await new Promise(r=>{ el.src=c; window._onAudioChunk&&window._onAudioChunk(c); el.onended=r; el.play(); });
+    }
+    window._onAudioChunk&&window._onAudioChunk(null);
+    res();
+  });
+}
+async function sendDialogTurn(text, onState){
+  window._studioPersonaId = personaId;
+  // backchannel: prepare now, schedule at 450ms — canceled automatically
+  // when the first answer chunk arrives first (race guard in backchannel.js)
+  Backchannel.prepare(text).then(()=>Backchannel.play(450));
+  const fd=new FormData();
+  fd.append('persona_id', personaId); fd.append('message', text);
+  const job=await api('/api/jobs/turn',{method:'POST',body:fd});
+  pollJob(job.id, async j=>{ await onState(j); });
+}
+async function fetchPersonaFacts(){ return api('/api/facts?persona_id='+personaId).catch(()=>[]); }
+
+/* ================= Facetime view ================= */
+function renderFacetime(){
+  $('view').innerHTML = `
+    <div class="call-stage ft">
+      <div class="stage-wrap" id="ftStage">
+        <canvas id="vrmCanvas" class="veiled"></canvas>
+        <div class="fallback-portrait" id="fbPortrait">
+          <img src="/api/personas/portrait" alt="" onerror="this.parentElement.innerHTML='<div class=empty-hint>Kein Portrait hinterlegt</div>'">
+        </div>
+        <span class="stage-badge status-pill" id="engineBadge">Engine startet…</span>
+        <div class="ft-calling" id="ftCalling">
+          <div class="calling-orb">🎭</div>
+          <div>Verbinde mit Emma…</div>
+        </div>
+      </div>
+      <div class="call-status" id="ftStatus">Bereit</div>
+
+      <div class="transcript-fab">
+        <button class="icon-btn" id="txToggleFt" title="Transkript">📄</button>
+        <div class="transcript-panel hidden" id="txPanelFt">
+          <div class="chat-log" id="chatLog"><div class="empty-hint">Transkript leer.</div></div>
+        </div>
+      </div>
+
+      <div class="facetime-panel composer">
+          <button class="mic-btn" id="ftMic" title="Mikrofon an/aus">🎙️</button>
+          <button class="call-btn big accent small-in-composer" id="ftHf" title="Handsfree">📞</button>
+          <input type="text" id="ftMsg" placeholder="sag etwas… (Enter)">
+          <button class="btn" id="ftSend">Senden</button>
+      </div>
+    </div>`;
+  initFacetimeEngine();
+  bindCallEngine('facetime');
+  $('ftSend').onclick=()=>{ const t=$('ftMsg').value.trim(); if(t){$('ftMsg').value=''; revealFtAvatar(); CallSession.pushText(t);} };
+}
+
+let ftEngine=null;
+function initFacetimeEngine(){
+  if(ftEngine){ ftEngine.attach($('vrmCanvas'), $('fbPortrait'), $('engineBadge')); return; }
+  import('/static/js/facetime-engine.js?v=3').then(m=>{
+    ftEngine=new m.FacetimeEngine();
+    ftEngine.attach($('vrmCanvas'), $('fbPortrait'), $('engineBadge'));
+    window._ftEngine = ftEngine;
+  }).catch(e=>{
+    const b=$('engineBadge'); if(b) b.textContent='Fallback';
+    const cv=$('vrmCanvas'), ov=$('ftCalling');
+    if(cv) cv.classList.remove('veiled');
+    if(ov){ ov.classList.add('gone'); setTimeout(()=>ov.remove(),800); }
+  });
+}
+
+/** Facetime: Avatar wird erst bei der ersten echten Interaktion gezeigt
+    (Mikro an, Handsfree an oder erster Text) — davor läuft die Calling-Animation. */
+function revealFtAvatar(){
+  // erst zeigen, wenn der VRM wirklich gerendert werden kann — sonst bliebe
+  // bei frühem Klick ein leerer Canvas sichtbar
+  if(revealFtAvatar._watch) return;
+  revealFtAvatar._watch = setInterval(()=>{
+    if(!(window._ftEngine && window._ftEngine.vrm)) return;
+    clearInterval(revealFtAvatar._watch);
+    revealFtAvatar._watch = null;
+    const cv=$('vrmCanvas'), ov=$('ftCalling');
+    if(cv) cv.classList.remove('veiled');
+    if(ov){ ov.classList.add('gone'); setTimeout(()=>ov.remove(), 800); }
+  }, 250);
+}
+
+/* ================= Telefon view (call UI) ================= */
+function renderCall(){
+  $('view').innerHTML = `
+    <div class="call-stage" id="callStage">
+      <div class="call-avatar-wrap">
+        <div class="call-avatar" id="callAvatar">
+          <img src="/api/personas/portrait" onerror="this.style.display='none'">
+        </div>
+        <div class="call-wavebars" id="callWave"><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+      <div class="call-status" id="callStatus">Bereit</div>
+
+      <div class="transcript-fab">
+        <button class="icon-btn" id="txToggle" title="Transkript">📄</button>
+        <div class="transcript-panel hidden" id="txPanel">
+          <div class="chat-log" id="chatLog"><div class="empty-hint">Transkript leer.</div></div>
+        </div>
+      </div>
+
+      <div class="call-controls">
+        <button class="call-btn" id="micBtn2" title="Mikrofon an/aus">🎙️</button>
+        <button class="call-btn big accent" id="handsfreeBtn" title="Handsfree: automatisch zuhören">📞</button>
+        <button class="call-btn danger" id="hangupBtn" title="Auflegen (Queue leeren, Mic aus)">🔇</button>
+      </div>
+      <input type="text" id="callMsg" class="call-text-input" placeholder="oder tippen… (Enter)">
+    </div>`;
+  bindCallEngine('call');
+}
+
+function bindCallEngine(mode){
+  const stage = mode === 'facetime' ? null : document.getElementById('callStage');
+  CallSession.setPersona(personaId);
+  CallSession.callback = ev => {
+    const st = mode==='facetime' ? $('ftStatus') : $('callStatus');
+    if (!st && mode!=='facetime') return;
+    switch(ev.type){
+      case 'mic': {
+        const b = $(mode==='facetime'?'ftMic':'micBtn2');
+        if(b){ b.classList.toggle('on', ev.on); b.classList.toggle('off', !ev.on); }
+        if(mode==='facetime' && ev.on) revealFtAvatar();
+        setStatus(st, ev.on ? 'Mikro an' : 'Mikro aus'); break;
+      }
+      case 'handsfree':
+        if(mode==='facetime' && ev.on) revealFtAvatar();
+        break;
+      case 'listening':
+        if(mode==='facetime') revealFtAvatar();
+        setStatus(st,'🎧 hört zu…'); break;
+      case 'transcribing':
+        if(mode==='facetime') revealFtAvatar();
+        setStatus(st,'✍ transkribiere…'); break;
+      case 'user':
+        if(mode==='facetime') revealFtAvatar();
+        appendTranscript('user', ev.text);
+        setStatus(st,'denkt nach…');
+        break;
+      case 'assistant': {
+        if(mode==='facetime') revealFtAvatar();   // Rückfallebene: Antwort da → Vorhang weg
+        appendTranscript('assistant', ev.text);
+        setStatus(st,'spricht…');
+        if(ev.timings) window.DebugConsole && DebugConsole.log(
+          `⏱ LLM ${(ev.timings.llm ?? '?')}s · erstes Audio nach ${(ev.timings.tts_first ?? '?')}s`);
+        // transcript panel shows the reply text
+        break;
+      }
+      case 'playback-end': setStatus(st, CallSession.isHandsfree() ? '🎧 hört zu…' : 'Bereit'); break;
+      case 'interjected': case 'flushed': setStatus(st,'⏸ unterbrochen'); break;
+      case 'error': setStatus(st,'Fehler: '+ev.error); break;
+    }
+    // facetime lip-sync hook
+    if (mode==='facetime' && window._ftEngine && ev.type==='playback-start') { /* analyser auto-binds via play event */ }
+  };
+
+  function setStatus(el, txt){ if(el) el.textContent = txt; }
+  function appendTranscript(role, text){
+    const log = $('chatLog'); if(!log) return;
+    if(log.querySelector('.empty-hint')) log.innerHTML='';
+    log.insertAdjacentHTML('beforeend', `<div class="msg ${role}">${text}</div>`);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // restore persistent history into transcript
+  api('/api/history/'+personaId).then(msgs=>{
+    const log=$('chatLog');
+    if(!msgs.length || !log) return;
+    log.innerHTML='';
+    msgs.forEach(m=>log.insertAdjacentHTML('beforeend', `<div class="msg ${m.role}">${m.content}</div>`));
+    log.scrollTop=log.scrollHeight;
+  }).catch(()=>{});
+
+  // controls
+  const micB = $(mode==='facetime'?'ftMic':'micBtn2');
+  if(micB) micB.onclick = async () => { await CallSession.toggleMic(); };
+  const hfB = $(mode==='facetime'?'ftHf':'handsfreeBtn');
+  if(hfB) hfB.onclick = () => {
+    const on = !CallSession.isHandsfree();
+    CallSession.setHandsfree(on);
+    hfB.classList.toggle('active', on);
+    if(on && !CallSession.isMicOn()) CallSession.toggleMic();
+  };
+  const huB = $(mode==='facetime'?null:'hangupBtn');
+  if(huB) huB.onclick = () => {
+    CallSession.flushQueue();
+    CallSession.setHandsfree(false);
+    CallSession.setMic(false);
+    if(hfB) hfB.classList.remove('active');
+  };
+  const input = $(mode==='facetime'?'ftMsg':'callMsg');
+  if(input) input.addEventListener('keydown', e=>{
+    if(e.key==='Enter' && input.value.trim()){ const t=input.value.trim(); input.value=''; if(mode==='facetime') revealFtAvatar(); CallSession.pushText(t); }
+  });
+  // interject: clicking the avatar/status while Emma speaks flushes playback
+  const interjectTarget = mode==='facetime' ? $('vrmCanvas') : $('callAvatar');
+  if(interjectTarget) interjectTarget.addEventListener('click', ()=>{
+    if(CallSession.state.speaking) CallSession.flushQueue();
+  });
+  // transcript toggle
+  const txB = mode==='facetime' ? $('txToggleFt') : $('txToggle');
+  const txP = mode==='facetime' ? $('txPanelFt') : $('txPanel');
+  if(txB && txP) txB.onclick = () => txP.classList.toggle('hidden');
+}
+
+/* (old chat-style call view removed — call UI is now telephony-style above) */
+
+/* ================= Videos view ================= */
+function renderVideos(){
+  $('view').innerHTML = `
+    <div class="card render-now">
+      <input type="text" id="vidTopic" placeholder="Neue Video-Message: Thema oder Botschaft…">
+      <select id="vidMode" style="width:auto">
+        <option value="">Auto</option><option value="tts_pre">TTS vorab</option><option value="h3_native">H3 nativ</option>
+      </select>
+      <button class="btn" id="vidGo">Rendern</button>
+    </div>
+    <div id="vidActive" style="margin-bottom:16px"></div>
+    <div class="video-grid" id="vidGrid"><div class="empty-hint">lädt…</div></div>`;
+  $('vidGo').onclick=async()=>{
+    const t=$('vidTopic').value.trim(); if(!t) return toast('Thema eingeben', true);
+    $('vidTopic').value='';
+    const fd=new FormData();
+    fd.append('persona_id',personaId); fd.append('topic',t); fd.append('speech_mode',$('vidMode').value);
+    const job=await api('/api/jobs/video',{method:'POST',body:fd});
+    showActiveRender(job.id);
+    toast('Render gestartet — dauert ein paar Minuten');
+  };
+  loadVideoHistory();
+}
+
+function showActiveRender(jobId){
+  $('vidActive').innerHTML=`<div class="card" id="ar-${jobId}">Render <b>${jobId}</b> läuft…</div>`;
+  pollJob(jobId, j=>{
+    const el=$('ar-'+jobId); if(!el) return;
+    if(j.state==='done'){ el.innerHTML=`✅ Fertig!`; setTimeout(()=>{el.remove(); loadVideoHistory();},1200); }
+    else if(j.state==='failed'){ el.innerHTML=`❌ Fehlgeschlagen: ${j.error||''}`; }
+    else { el.innerHTML=`Render läuft… ${statusPill(j.state)}`; }
+  }, 4000);
+}
+
+async function loadVideoHistory(){
+  const jobs=await api('/api/jobs?persona_id='+personaId).catch(()=>[]);
+  const vids=jobs.filter(j=>j.kind==='video_message'&&j.state==='done'&&j.render_path);
+  $('vidGrid').innerHTML = vids.length
+    ? vids.map(j=>`
+      <div class="video-card">
+        <video src="/api/jobs/${j.id}/video" controls preload="metadata"></video>
+        <div class="vc-body">${(j.user_input||'').slice(0,80)}<br><span style="color:var(--text-faint)">${new Date(j.created_at*1000).toLocaleString('de-DE')} · ${j.speech_mode||''}</span></div>
+      </div>`).join('')
+    : '<div class="empty-hint">Noch keine Video-Messages.</div>';
+}
+
+/* ================= Personas view ================= */
+function renderPersonas(){
+  const p=currentPersona()||{};
+  $('view').innerHTML = `
+    <div class="grid-2">
+      <div class="card">
+        <div class="persona-card-row" style="margin-bottom:16px">
+          <img src="/api/personas/portrait" onerror="this.style.visibility='hidden'">
+          <div><b style="font-size:17px">${p.name||'—'}</b><br>
+            <span style="font-size:13px;color:var(--text-dim)">
+              Bild ${p.ref_image?'✓':'—'} · Stimme ${p.voice_sample?'✓':'—'} · Profil ${p.voice_profile||'—'} · VRM ${p.vrm_model||'—'} · Silent ${Number(p.silent_summary) !== 0 ? '✓ ' + Math.round((p.silent_ratio ?? 0.8) * 100) + '% verworfen' : '—'}
+            </span></div>
+        </div>
+        <div class="field"><label>Persönlichkeit (System-Prompt)</label>
+          <textarea id="pPrompt">${p.personality_prompt||''}</textarea></div>
+        <div class="grid-2">
+          <div class="field"><label>Sprache</label>
+            <select id="pLang">${['German','English'].map(l=>`<option ${p.language===l?'selected':''}>${l}</option>`).join('')}</select></div>
+          <div class="field"><label>OmniVoice-Profil</label>
+            <input type="text" id="pVoiceProfile" value="${p.voice_profile||'emma_alicia'}"></div>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label>Silent Summary (Kamera)</label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px" title="Emma darf auf reine Kamera-Zustandsbeschreibungen (User sagt nichts) selbst entscheiden, ob sie reagiert.">
+              <input type="checkbox" id="pSilent" ${Number(p.silent_summary) !== 0 ? 'checked' : ''} style="width:auto"> Aktiv</label></div>
+          <div class="field"><label>verworfene Silent-Turns (%)</label>
+            <input type="number" id="pRatio" min="0" max="100" step="5" title="Mindestanteil der stillen Momente, in denen Emma NICHT antwortet (80 = 4 von 5)." value="${Math.round((p.silent_ratio ?? 0.8) * 100)}"></div>
+        </div>
+        <button class="btn" onclick="savePersona()">Speichern</button>
+      </div>
+      <div>
+        <div class="card"><h3>Referenz-Bild (fotoreale Ebene)</h3>
+          <div class="upload-tile" onclick="$('imgFile').click()">📷 Bild hochladen — Grundlage für Video-Messages</div>
+          <input type="file" id="imgFile" accept="image/*" style="display:none" onchange="uploadAsset('image',this)"></div>
+        <div class="card" style="margin-top:14px"><h3>Stimmprobe (H3-native Ebene)</h3>
+          <div class="upload-tile" onclick="$('voiceFile').click()">🎤 Audio hochladen — Voice-Referenz für H3</div>
+          <input type="file" id="voiceFile" accept="audio/*" style="display:none" onchange="uploadAsset('voice',this)"></div>
+        <div class="card" style="margin-top:14px"><h3>Neue Persona</h3>
+          <div class="field"><input type="text" id="npName" placeholder="Name"></div>
+          <button class="btn secondary" onclick="createPersona()">Anlegen</button></div>
+      </div>
+    </div>`;
+}
+
+async function savePersona(){
+  await api('/api/personas/'+personaId, {method:'PATCH', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({personality_prompt:$('pPrompt').value, language:$('pLang').value, voice_profile:$('pVoiceProfile').value, silent_summary:$('pSilent').checked, silent_ratio:Math.min(100, Math.max(0, Number($('pRatio').value))) / 100})});
+  toast('Gespeichert'); loadPersonas();
+}
+async function uploadAsset(kind, inp){
+  if(!inp.files[0]) return;
+  const fd=new FormData(); fd.append('file', inp.files[0]);
+  await api(`/api/personas/${personaId}/${kind}`, {method:'POST', body:fd});
+  toast(kind==='image'?'Bild hochgeladen':'Stimme hochgeladen'); loadPersonas();
+}
+async function createPersona(){
+  const n=$('npName').value.trim(); if(!n) return;
+  const p=await api('/api/personas',{method:'POST', body:new URLSearchParams({name:n})});
+  $('npName').value=''; await loadPersonas(); personaId=p.id; onPersonaSwitch(); go('personas');
+}
+
+/* ================= Facts view ================= */
+function renderFacts(){
+  $('view').innerHTML = `
+    <div class="grid-31">
+      <div class="card">
+        <h3>Faktenkarten — ${currentPersona()?.name||''}</h3>
+        <div class="row" style="margin-bottom:12px">
+          <input type="text" id="factNew" placeholder="Neuer Fakt… (Enter)">
+          <button class="btn" onclick="addFact()">+</button>
+        </div>
+        <ul class="fact-list" id="factList"></ul>
+      </div>
+      <div class="card">
+        <h3>Suchen</h3>
+        <input type="text" id="factQ" placeholder="Semantische Suche…">
+        <div id="factResults" style="margin-top:10px;font-size:13.5px;color:var(--text-dim)"></div>
+      </div>
+    </div>`;
+  $('factNew').addEventListener('keydown',e=>{ if(e.key==='Enter') addFact(); });
+  $('factQ').addEventListener('input', e=>searchFacts(e.target.value));
+  loadFacts();
+}
+async function loadFacts(){
+  const facts=await api('/api/facts').catch(()=>[]);
+  $('factList').innerHTML = facts.length ? facts.map(f=>`
+    <li><div style="flex:1">${f.fact}<br><span class="fact-scope">${f.persona_id?'persona-scoped':'global'}</span></div>
+        <button class="del" onclick="delFact('${f.id}')">×</button></li>`).join('')
+    : '<li class="empty-hint" style="display:block">Noch keine Fakten. „Basti hat eine Katze" o.ä. — der Avatar merkt sichs.</li>';
+}
+async function addFact(){
+  const f=$('factNew').value.trim(); if(!f) return;
+  const fd=new FormData(); fd.append('fact',f); fd.append('persona_id',personaId);
+  await api('/api/facts',{method:'POST',body:fd});
+  $('factNew').value=''; loadFacts(); toast('Merk ich mir');
+}
+async function delFact(id){ await api('/api/facts/'+id,{method:'DELETE'}); loadFacts(); }
+async function searchFacts(q){
+  if(!q.trim()){ $('factResults').textContent=''; return; }
+  const hits=await api('/api/facts?q='+encodeURIComponent(q)+'&persona_id='+personaId).catch(()=>[]);
+  $('factResults').innerHTML = hits.length
+    ? '<ul class="fact-list">'+hits.map(h=>`<li><div style="flex:1">${h.fact}</div></li>`).join('')+'</ul>'
+    : 'Nichts gefunden — Websuche würde im Dialog greifen.';
+}
+
+/* ================= boot ================= */
+async function loadPersonas(){
+  personas=await api('/api/personas');
+  $('persona').innerHTML=personas.map(p=>`<option value="${p.id}">${p.name}</option>`).join('');
+  personaId=localStorage.getItem('studioPersona');
+  if(!personas.find(p=>p.id===personaId)) personaId=personas[0]?.id;
+  if(personaId) $('persona').value=personaId;
+  // service health
+  api('/api/personas').catch(()=>{});
+  fetch('/api/health/omnivoice').then(r=>r.json()).then(d=>{
+    $('svc-omni').className='svc-dot '+(d.ok?'ok':'bad');
+  }).catch(()=>{ $('svc-omni').className='svc-dot bad'; });
+  fetch('/api/health/comfy').then(r=>r.json()).then(d=>{
+    $('svc-comfy').className='svc-dot '+(d.ok?'ok':'bad');
+  }).catch(()=>{ $('svc-comfy').className='svc-dot bad'; });
+}
+loadPersonas().then(()=>{
+  go((location.hash||'#facetime').slice(1));
+});
+</script>
+</body>
+</html>
