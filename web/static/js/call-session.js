@@ -640,7 +640,11 @@ const CallSession = (() => {
 
   // ================= PUBLIC =================
 
-  async function pushText(text) {           // typed input path
+  async function pushText(text, requireCall = false) {           // typed input path
+    if (requireCall && !callSessionId) {
+      emit({ type: 'error', error: 'Kein aktiver Call — erst auf Call drücken.' });
+      return;
+    }
     Backchannel.cancel();
     emit({ type: 'user', text });
     if (FILLERS_ENABLED) {                  // siehe FILLERS_ENABLED oben
@@ -701,15 +705,19 @@ const CallSession = (() => {
     if (wsReady) micNode.port.postMessage({ kind: 'enable', value: true });
   }
 
-  /** Hang up: finalize the server session, then tear down mic + WS. */
+  /** Hang up: close the WS first (server drain persists the last reply), then
+      ask the server to finalize — it waits for that drain — and tear down. */
   async function endCall() {
     const id = callSessionId;
     if (!id) return;
     callSessionId = null;
     muted = false;
+    emit({ type: 'mic', on: false });   // Mute-Button synchron halten
+    closeWs();                          // Server-Drain vor dem /end-Request triggern
     emit({ type: 'call-end', id });
-    // Server finalizes (idempotent — the WS-teardown path does the same when
-    // the tab dies first); post-call summarization then runs in the background.
+    // Der Server wartet auf Drain/Unregister und finalisiert dann (idempotent —
+    // der WS-Tearing-Pfad tut dasselbe, wenn das Tab zuerst stirbt); die
+    // Post-Call-Zusammenfassung läuft danach im Hintergrund.
     try {
       await fetch('/api/calls/end', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -726,7 +734,6 @@ const CallSession = (() => {
     micSrc = null;
     flushPlaybackBuffer();
     clockActive = false;
-    closeWs();
   }
 
   /** Mute: stop streaming mic audio, the call itself stays alive (FaceTime). */

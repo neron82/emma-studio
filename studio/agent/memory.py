@@ -93,12 +93,14 @@ def append_summary(persona_id: str, summary: str, session: dict | None = None,
 
     entries = parse_entries(existing) + [entry]
     body = "\n\n".join(entries)
-    while count_words(body) > config.MEMORY_MAX_WORDS and len(entries) > 1:
+    full = f"{MEMORY_TITLE}\n\n{body}\n"
+    while count_words(full) > config.MEMORY_MAX_WORDS and len(entries) > 1:
         entries.pop(0)  # ältester Eintrag weg
         body = "\n\n".join(entries)
+        full = f"{MEMORY_TITLE}\n\n{body}\n"
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{MEMORY_TITLE}\n\n{body}\n", encoding="utf-8")
+    path.write_text(full, encoding="utf-8")
     return path
 
 

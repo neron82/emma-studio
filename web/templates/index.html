@@ -231,7 +231,7 @@ function renderFacetime(){
     </div>`;
   initFacetimeEngine();
   bindCallEngine('facetime');
-  $('ftSend').onclick=()=>{ const t=$('ftMsg').value.trim(); if(t){$('ftMsg').value=''; revealFtAvatar(); CallSession.pushText(t);} };
+  $('ftSend').onclick=()=>{ const t=$('ftMsg').value.trim(); if(t){$('ftMsg').value=''; revealFtAvatar(); CallSession.pushText(t, true);} };
 }
 
 /* ================= Facetime call bar (Call / Mute / Hang-up) ================= */
@@ -348,7 +348,7 @@ function bindCallEngine(mode){
         if(mode==='facetime'){ enterFtCall(ev.at); revealFtAvatar(); }
         break;
       case 'call-end':
-        if(mode==='facetime') exitFtCall();
+        if(mode==='facetime'){ exitFtCall(); setStatus(st, 'Bereit'); }
         break;
       case 'listening':
         if(mode==='facetime') revealFtAvatar();
@@ -416,7 +416,7 @@ function bindCallEngine(mode){
   if(ftHangupB) ftHangupB.onclick = async () => { stopFtCallTimer(); await CallSession.endCall(); };
   const input = $(mode==='facetime'?'ftMsg':'callMsg');
   if(input) input.addEventListener('keydown', e=>{
-    if(e.key==='Enter' && input.value.trim()){ const t=input.value.trim(); input.value=''; if(mode==='facetime') revealFtAvatar(); CallSession.pushText(t); }
+    if(e.key==='Enter' && input.value.trim()){ const t=input.value.trim(); input.value=''; if(mode==='facetime') revealFtAvatar(); CallSession.pushText(t, mode==='facetime'); }
   });
   // interject: clicking the avatar/status while Emma speaks flushes playback
   const interjectTarget = mode==='facetime' ? $('vrmCanvas') : $('callAvatar');

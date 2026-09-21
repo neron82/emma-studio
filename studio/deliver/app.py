@@ -38,7 +38,7 @@ from ..core.store import Store
 from ..agent.memory import schedule_call_finalization
 from ..core import pipeline
 from ..speech import engine
-from .realtime.websocket_router import register_realtime
+from .realtime.websocket_router import register_realtime, SESSION_END_QUARANTINE_TIMEOUT_S
 
 _rt_holder: dict[str, Any] = {}
 
@@ -47,6 +47,7 @@ _rt_holder: dict[str, Any] = {}
 # erklären was der Dialog sieht — z. B. der injizierte Blickkontext.
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("studio").setLevel(os.getenv("STUDIO_LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("studio")
 
 
 @asynccontextmanager
@@ -332,12 +333,43 @@ async def start_call(payload: dict):
     return store.create_session(persona_id)
 
 
+async def _wait_call_release(session_id: str, timeout: float | None = None) -> bool:
+    """Wartet, bis die an *session_id* gebundene WS-Verbindung freigegeben ist.
+
+    Der Router gibt das Pipeline-Unit erst in einem spawneten Task nach dem
+    Close frei; die letzte Assistant-Antwort wird erst während dieses Drains
+    persistiert. Finalisieren davor ließe die Zusammenfassung den letzten Turn
+    vermissen. Ohne live gebundene Verbindung gibt es nichts abzuwarten.
+    Bei Timeout (gesteckter Handler) wird ``False`` zurückgegeben — dann darf
+    der Aufrufer nicht finalisieren; die defensive Finalisierung im Router
+    läuft nach dem Quarantäne-Deadline nach.
+    """
+    if timeout is None:
+        # Der Router force-unregistriert nach diesem Deadline — länger nützt nichts.
+        timeout = SESSION_END_QUARANTINE_TIMEOUT_S + 5.0
+    loop = asyncio.get_running_loop()
+    for unit in list(_rt_pool):
+        svc = getattr(unit, "service", None)
+        if svc is None:
+            continue
+        conn_id = svc.conn_for_call_session(session_id)
+        if conn_id is None:
+            continue
+        ok = await loop.run_in_executor(None, svc.wait_call_session_released, conn_id, timeout)
+        if not ok:
+            logger.warning("Call %s: Drain nach %.0fs nicht freigegeben — Finalisierung vertagt", session_id, timeout)
+            return False
+    return True
+
 @app.post("/api/calls/end")
 async def end_call(payload: dict):
     """Auflegen: Session finalisieren + Memory-Zusammenfassung planen (exakt einmal)."""
     session = store.get_session(str(payload.get("session_id", "")))
     if session is None:
         raise HTTPException(404, "unknown session_id")
+    released = await _wait_call_release(session["id"])
+    if not released:
+        raise HTTPException(503, "Call-Verbindung wird noch aufgeräumt — Session bleibt aktiv")
     row = store.finalize_session_now(session["id"])
     if row is not None:
         schedule_call_finalization(store, row)

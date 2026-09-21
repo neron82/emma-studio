@@ -325,6 +325,7 @@ class EmmaRealtimeService(RealtimeService):
         self._lm_text_seen: dict[str, set[str]] = {}
         self._persona_by_conn: dict[str, str] = {}
         self._call_session_by_conn: dict[str, str] = {}  # conn_id → DB-Call-Session
+        self._call_release_events: dict[str, threading.Event] = {}   # conn_id → set, wenn unregister abgeschlossen
         self._last_persisted: dict[str, str] = {}
         # Visueller Kontext: Verlaufs-Zyklen (5 s) statt einer Rollen-Summary.
         # Der Analyzer-Thread füllt sie; Gates markieren Aktivität; silent
@@ -381,6 +382,7 @@ class EmmaRealtimeService(RealtimeService):
         if persona_id and row["persona_id"] != persona_id:
             logger.warning("session.update: session %s belongs to another persona — not bound", session_id)
             return
+        self._call_release_events.setdefault(conn_id, threading.Event())
         self._call_session_by_conn[conn_id] = session_id
         logger.info("Connection %s bound to call session %s", conn_id, session_id)
 
@@ -423,6 +425,9 @@ class EmmaRealtimeService(RealtimeService):
             self._silent_user_items.pop(key, None)
         self._vlm_warned.discard(conn_id)      # set, kein dict
         super().unregister(conn_id)
+        ev = self._call_release_events.pop(conn_id, None)
+        if ev is not None:
+            ev.set()
 
     def _finalize_call_session(self, conn_id: str) -> None:
         """Defensive Call-Finalisierung bei Verbindungstrennung (Tab zu, Crash):
@@ -446,6 +451,21 @@ class EmmaRealtimeService(RealtimeService):
             schedule_call_finalization(self._store, row)
         except Exception as exc:  # noqa: BLE001
             log_exception(logger, "memory scheduling failed", exc)
+
+    def conn_for_call_session(self, session_id: str) -> Optional[str]:
+        """conn_id der an *session_id* gebundenen Verbindung (oder None)."""
+        for conn_id, sid in self._call_session_by_conn.items():
+            if sid == session_id:
+                return conn_id
+        return None
+
+    def wait_call_session_released(self, conn_id: str, timeout: float) -> bool:
+        """Blockiert, bis *conn_id* unregister'd ist (Drain komplett → das
+        Transkript ist vollständig). ``True`` bei Timeout oder fehlendem Event."""
+        ev = self._call_release_events.get(conn_id)
+        if ev is None:
+            return True
+        return ev.wait(timeout)
 
     # ── Statuszeilen für das Debug-Overlay ───────────────────────────────
 
