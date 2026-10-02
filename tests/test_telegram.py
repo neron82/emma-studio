@@ -14,6 +14,8 @@ import pytest
 from studio import config
 from studio.agent import memory
 from studio.core.store import Store
+# Import SDK-dependent speech modules before fixtures replace HTTP client classes.
+from studio.speech import stt
 from studio.deliver import telegram as transport
 from studio.deliver.telegram_config import BotSettings
 
@@ -301,7 +303,7 @@ def test_unauthorized_updates_are_silent_without_state_changes(env, chat_id, cha
 
 
 @pytest.mark.parametrize("failure", [None, "upload", "convert", "tts"])
-def test_complete_opus_delivery_and_cleanup_preserve_model_reply(env, monkeypatch, failure):
+def test_complete_opus_delivery_and_cleanup_preserve_model_reply(env, monkeypatch, failure, caplog):
     if not shutil.which("ffmpeg"):
         pytest.skip("ffmpeg is required for actual Opus conversion")
     env.bot._voice_reply = transport.TelegramTransport._voice_reply.__get__(env.bot)
@@ -315,7 +317,7 @@ def test_complete_opus_delivery_and_cleanup_preserve_model_reply(env, monkeypatc
             audio.setframerate(24000)
             audio.writeframes(b"\x00\x00" * 24000)
         if failure == "tts":
-            raise RuntimeError("secret-token")
+            raise transport.tts.TTSError("secret-token", status_code=500)
         return out_path
 
     monkeypatch.setattr(transport.tts, "synthesize", synthesize)
@@ -338,6 +340,13 @@ def test_complete_opus_delivery_and_cleanup_preserve_model_reply(env, monkeypatc
             assert all(not path.exists() for path in message.message.audio_paths)
         if failure:
             assert "saved" in message.message.replies[-1]
+            stage = {"tts": "synthesis", "convert": "conversion", "upload": "upload"}[failure]
+            assert f"Voice {stage} failed" in message.message.replies[-1]
+            assert f"stage={stage}" in caplog.text
+            if failure == "tts":
+                assert "http_status=500" in caplog.text
+            assert "secret-token" not in caplog.text
+            assert "Completed reply." not in caplog.text
             assert "secret-token" not in " ".join(message.message.replies)
         else:
             assert message.message.replies == []
@@ -403,7 +412,6 @@ def test_model_picker_pages_long_utf8_ids_and_selects_discovered_model(env):
 
 @pytest.mark.parametrize("fail_stt", [False, True])
 def test_voice_input_uses_durable_turn_and_removes_download(env, monkeypatch, fail_stt):
-    from studio.speech import stt
     downloads = []
 
     class Download:

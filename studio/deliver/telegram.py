@@ -28,6 +28,17 @@ from ..speech import tts
 from .telegram_config import BotSettings, load_settings
 
 
+logger = logging.getLogger(__name__)
+
+
+class VoiceReplyError(RuntimeError):
+    """Safe stage label; never carries an upstream exception message."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__(stage)
+
+
 class TransportError(RuntimeError):
     """Only locally authored, credential-free messages may cross this boundary."""
 
@@ -470,32 +481,57 @@ class TelegramTransport:
         self.store.add_message(persona["id"], "assistant", response, session_id=session["id"])
         try:
             await self._voice_reply(update, response, persona)
+        except VoiceReplyError as exc:
+            hints = {
+                "preparation": "Check data-directory permissions and free disk space.",
+                "synthesis": "Check the OmniVoice service and its available GPU memory.",
+                "conversion": "Check ffmpeg and the generated audio format.",
+                "upload": "Check Telegram connectivity and upload permissions.",
+            }
+            raise TransportError(
+                f"Voice {exc.stage} failed. The complete model reply is saved in this session; "
+                + hints[exc.stage]
+            ) from None
         except Exception:
             raise TransportError("Voice generation or delivery failed. The complete model reply is saved in this session; check TTS/ffmpeg and Telegram connectivity.") from None
 
     async def _voice_reply(self, update, response: str, persona: dict):
-        root = config.DATA_DIR / "telegram"
-        root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="reply-", dir=root) as directory:
-            wav = Path(directory) / "reply.wav"
-            opus = Path(directory) / "reply.ogg"
-            await tts.synthesize(response, voice=persona.get("voice_profile") or config.TTS_VOICE_DEFAULT,
-                                 language=persona.get("language"), out_path=wav)
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(wav),
-                "-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", str(opus),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
-                code = await process.wait()
-            finally:
-                if process.returncode is None:
-                    process.kill()
-                    await process.wait()
-            if code or not opus.is_file() or not opus.stat().st_size:
-                raise RuntimeError("voice conversion failed")
-            with opus.open("rb") as audio:
-                await update.effective_message.reply_voice(voice=audio)
+        stage = "preparation"
+        try:
+            root = config.DATA_DIR / "telegram"
+            root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="reply-", dir=root) as directory:
+                wav = Path(directory) / "reply.wav"
+                opus = Path(directory) / "reply.ogg"
+                stage = "synthesis"
+                await tts.synthesize(response, voice=persona.get("voice_profile") or config.TTS_VOICE_DEFAULT,
+                                     language=persona.get("language"), out_path=wav)
+                stage = "conversion"
+                process = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", str(wav),
+                    "-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", str(opus),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    code = await process.wait()
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+                if code or not opus.is_file() or not opus.stat().st_size:
+                    raise RuntimeError("voice conversion failed")
+                stage = "upload"
+                with opus.open("rb") as audio:
+                    await update.effective_message.reply_voice(voice=audio)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if not isinstance(status, int) or not 100 <= status <= 599:
+                status = None
+            # Tokens, transcripts, provider bodies and URLs can be present in
+            # exception messages. Log only the stage, exception class and status.
+            logger.warning("Telegram voice reply failed: stage=%s error=%s http_status=%s",
+                           stage, type(exc).__name__, status)
+            raise VoiceReplyError(stage) from None
 
     @serialized
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):

@@ -13,7 +13,9 @@ from .. import config
 
 
 class TTSError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 async def synthesize(text: str, *, voice: str, out_path: Path,
@@ -33,7 +35,8 @@ async def synthesize(text: str, *, voice: str, out_path: Path,
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(url, json=payload)
     if resp.status_code != 200:
-        raise TTSError(f"OmniVoice HTTP {resp.status_code}: {resp.text[:300]}")
+        raise TTSError(f"OmniVoice HTTP {resp.status_code}: {resp.text[:300]}",
+                       status_code=resp.status_code)
     data = resp.content
     if len(data) < 1000:  # a real wav is never this small; guards error-JSON-as-wav
         raise TTSError(f"OmniVoice returned suspiciously small audio ({len(data)} bytes)")
@@ -53,7 +56,8 @@ def synthesize_sync(text: str, *, voice: str, out_path: Path,
     with httpx.Client(timeout=300) as client:
         resp = client.post(url, json=payload)
     if resp.status_code != 200:
-        raise TTSError(f"OmniVoice HTTP {resp.status_code}: {resp.text[:300]}")
+        raise TTSError(f"OmniVoice HTTP {resp.status_code}: {resp.text[:300]}",
+                       status_code=resp.status_code)
     data = resp.content
     if len(data) < 1000:
         raise TTSError(f"OmniVoice returned suspiciously small audio ({len(data)} bytes)")
