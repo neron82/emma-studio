@@ -35,10 +35,6 @@ def is_out_of_band(response: RealtimeResponseCreateParams | None) -> bool:
     return response is not None and response.conversation == "none"
 
 
-def next_power_of_2(x: int) -> int:
-    return 1 if x == 0 else 2 ** (x - 1).bit_length()
-
-
 def _generate_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 

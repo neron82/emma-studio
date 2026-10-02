@@ -1,11 +1,6 @@
-import base64
-import io
 import re
 from collections.abc import Callable
 from typing import Optional
-
-import requests  # type: ignore[import-untyped]
-from PIL import Image
 
 SMART_PUNCT_TRANSLATION = str.maketrans(
     {
@@ -279,16 +274,29 @@ def resolve_auto_language(language_code: Optional[str]) -> tuple[Optional[str], 
     return language_code, WHISPER_LANGUAGE_TO_LLM_LANGUAGE.get(language_code)
 
 
-def image_url_to_pil(image_url: str) -> Image.Image:
-    """Convert an image URL or base64 data URI to a PIL Image.
+# Reverse of the table above: language name -> STT code.
+_LLM_LANGUAGE_TO_WHISPER_LANGUAGE = {
+    name: code for code, name in WHISPER_LANGUAGE_TO_LLM_LANGUAGE.items()
+}
 
-    Accepts:
-    - 'data:image/...;base64,<b64>' data URIs
-    - 'https://...`` or ``http://...' URLs (fetched with a 10s timeout)
+
+def whisper_language_code(value: Optional[str]) -> Optional[str]:
+    """Any language spec -> a code Whisper accepts (``None`` when unknown).
+
+    Sources hand in both shapes: ISO codes (``"de"``, ``"de-DE"``, ``"de-auto"``
+    from the session/STT path) and plain names (``"German"`` — the persona
+    ``language`` column defaults to it and the silent-turn path forwards it).
+    Whisper only knows codes and raises ``ValueError`` for anything else, which
+    used to drop that sentence's whole viseme timeline — the mouth then stood
+    still for the rest of the answer. Unknown values return ``None`` so the
+    caller can fall back to its own default.
     """
-    if image_url.startswith("data:"):
-        _, b64_data = image_url.split(",", 1)
-        return Image.open(io.BytesIO(base64.b64decode(b64_data)))
-    resp = requests.get(image_url, timeout=10)
-    resp.raise_for_status()
-    return Image.open(io.BytesIO(resp.content))
+    if not value:
+        return None
+    value = value.strip().lower()
+    for separator in ("-", "_"):
+        if separator in value:
+            value = value.split(separator, 1)[0]
+    if value in WHISPER_LANGUAGE_TO_LLM_LANGUAGE:
+        return value
+    return _LLM_LANGUAGE_TO_WHISPER_LANGUAGE.get(value)

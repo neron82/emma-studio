@@ -5,7 +5,6 @@ The server resolves profiles internally; no clone-upload dance needed here.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import httpx

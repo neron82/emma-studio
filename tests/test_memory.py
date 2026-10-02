@@ -1,6 +1,7 @@
 """Memory-Module-Tests — ohne Netzwerk/LLM (Zusammenfassung wird ge-patcht)."""
 from __future__ import annotations
 
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -39,6 +40,35 @@ def test_append_and_roundtrip(tmp_path, monkeypatch):
     assert mem.memory_path("abc123").exists()
 
 
+def _append_from_process(base_dir, barrier, summary):
+    barrier.wait(timeout=10)
+    mem.append_summary("shared", summary, base_dir=base_dir)
+
+
+def test_summary_pool_keeps_concurrent_transport_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "MEMORY_MAX_WORDS", 1000)
+    context = multiprocessing.get_context("fork")
+    summaries = ["A garden plan.", "A roof repair.", "A travel plan.", "A book discussion."]
+    barrier = context.Barrier(len(summaries))
+    processes = [
+        context.Process(target=_append_from_process, args=(tmp_path, barrier, summary))
+        for summary in summaries
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    entries = mem.parse_entries(mem.load_memory("shared", base_dir=tmp_path))
+    assert {entry.split("\n", 1)[1] for entry in entries} == set(summaries)
+
+
 def test_oldest_entry_dropped_above_word_cap(tmp_path, monkeypatch):
     _personas_root(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "MEMORY_MAX_WORDS", 40)
@@ -72,7 +102,7 @@ def _word_blob(n):
 def test_summarize_in_range_returned_verbatim(monkeypatch):
     calls = []
 
-    def fake(messages):
+    def fake(messages, endpoint, *, session_id):
         calls.append(messages)
         return _word_blob(250)
 
@@ -84,14 +114,14 @@ def test_summarize_in_range_returned_verbatim(monkeypatch):
 
 def test_summarize_short_output_retried_once(monkeypatch):
     replies = iter([_word_blob(8), _word_blob(240)])
-    monkeypatch.setattr(mem, "_llm_complete", lambda messages: next(replies))
+    monkeypatch.setattr(mem, "_llm_complete", lambda messages, endpoint, *, session_id: next(replies))
     out = mem.summarize_call([{"role": "user", "content": "hi"}])
     assert len(out.split()) == 240
 
 
 def test_summarize_still_short_raises_and_finalize_writes_nothing(tmp_path, monkeypatch, store):
     _personas_root(tmp_path, monkeypatch)
-    monkeypatch.setattr(mem, "_llm_complete", lambda messages: _word_blob(5))
+    monkeypatch.setattr(mem, "_llm_complete", lambda messages, endpoint, *, session_id: _word_blob(5))
 
     p = store.create_persona("Emma")
     session = store.create_session(p["id"])
@@ -107,7 +137,7 @@ def test_summarize_still_short_raises_and_finalize_writes_nothing(tmp_path, monk
 
 
 def test_summarize_long_output_truncated_to_300(monkeypatch):
-    monkeypatch.setattr(mem, "_llm_complete", lambda messages: _word_blob(400))
+    monkeypatch.setattr(mem, "_llm_complete", lambda messages, endpoint, *, session_id: _word_blob(400))
     out = mem.summarize_call([{"role": "user", "content": "hi"}])
     assert 200 <= len(out.split()) <= 300
 
@@ -120,7 +150,7 @@ def test_finalize_call_memory_end_to_end(tmp_path, monkeypatch, store):
     store.add_message(p["id"], "assistant", "Great! What about you?", session_id=session["id"])
 
     monkeypatch.setattr(mem, "summarize_call",
-                        lambda transcript: "Summary: the user said hello to Emma.")
+                        lambda transcript, persona, *, session_id: "Summary: the user said hello to Emma.")
     mem.finalize_call_memory(store, session)
 
     row = store.get_session(session["id"])
@@ -149,7 +179,7 @@ def test_schedule_call_finalization_thread(tmp_path, monkeypatch, store):
     store.add_message(p["id"], "user", "Tell me about the weather.", session_id=session["id"])
 
     monkeypatch.setattr(mem, "summarize_call",
-                        lambda transcript: "Thread summary text.")
+                        lambda transcript, persona, *, session_id: "Thread summary text.")
     thread = mem.schedule_call_finalization(store, session)
     thread.join(timeout=5)
 

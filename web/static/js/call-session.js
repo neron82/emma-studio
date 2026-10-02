@@ -22,6 +22,10 @@ const CallSession = (() => {
   let mediaStream = null, micSrc = null, micNode = null;
   let audioCtx = null, workletsLoaded = null;
   let playbackNode = null, pendingAudio = [];
+  // Analyser am echten Ausgang: der Facetime-Engine liest daraus den
+  // Formant-Fallback, wenn keine Visem-Timeline vorliegt (das alte
+  // #audioOut-Element führt im Anruf kein Audio).
+  let playbackAnalyser = null;
   let onEvent = () => {};       // UI callbacks
   let personaId = null;
   let evtSeq = 0;
@@ -402,6 +406,10 @@ const CallSession = (() => {
     return { t: Math.max(0, (playedFrames - clockBaseline) / rate), active: clockActive };
   }
 
+  /** Analyser am echten Audio-Ausgang (Worklet). Der Facetime-Engine nutzt ihn
+      für den Formant-Fallback, wenn die Visem-Timeline keine Deckung hat. */
+  function outputAnalyser() { return playbackAnalyser; }
+
   // ================= AUDIO GRAPH =================
 
   async function ensureAudioCtx() {
@@ -424,7 +432,10 @@ const CallSession = (() => {
     });
     playbackNode.port.postMessage({ kind: 'config', inputRate: WIRE_RATE });
     playbackNode.port.onmessage = onPlaybackMsg;
-    playbackNode.connect(audioCtx.destination);
+    playbackAnalyser = audioCtx.createAnalyser();
+    playbackAnalyser.fftSize = 1024;          // Auflösung für Vokal-Bänder
+    playbackNode.connect(playbackAnalyser);
+    playbackAnalyser.connect(audioCtx.destination);
     dbg(`Playback-Worklet aktiv (${audioCtx.sampleRate} Hz Kontext, ${WIRE_RATE} Hz Wire)`);
     while (pendingAudio.length) postSamples(pendingAudio.shift());
   }
@@ -487,6 +498,14 @@ const CallSession = (() => {
       window.DebugConsole && DebugConsole.ok('Mikrofon freigeschaltet');
     } catch (e) {
       window.DebugConsole && DebugConsole.error('getUserMedia fehlgeschlagen: ' + e.name);
+      const message = e.name === 'NotAllowedError'
+        ? 'Mikrofonzugriff nicht erlaubt. Bitte erlaube das Mikrofon in den Website-Einstellungen.'
+        : e.name === 'NotFoundError'
+          ? 'Kein Mikrofon gefunden. Bitte verbinde ein Mikrofon und versuche es erneut.'
+          : e.name === 'NotReadableError'
+            ? 'Das Mikrofon ist nicht verfügbar. Prüfe, ob eine andere App es verwendet.'
+            : 'Mikrofon konnte nicht aktiviert werden: ' + e.message;
+      emit({ type: 'error', error: message });
       throw e;
     }
     await ensureAudioCtx();
@@ -696,15 +715,17 @@ const CallSession = (() => {
   // ================= FACETIME CALL (Call / Hang-up / Mute) =================
 
   /** Start a facetime call: create the server session first, then bring up
-      mic + WebSocket exactly like the old handsfree flow. */
-  async function startCall() {
+      mic + WebSocket exactly like the old handsfree flow.
+      `video` wird mitgeschickt, damit der Server den VLM (~15 GB) schon während
+      des Aufbaus vorladen kann statt mitten im ersten Turn. */
+  async function startCall(video) {
     if (callSessionId) return true;
     let session;
     try { await acquireMic(); } catch { return false; }  // getUserMedia already emitted the error
     try {
       const res = await fetch('/api/calls/start', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ persona_id: personaId }),
+        body: JSON.stringify({ persona_id: personaId, video: !!video }),
       });
       if (!res.ok) {
         let detail = `Call-Start fehlgeschlagen (HTTP ${res.status})`;
@@ -774,7 +795,7 @@ const CallSession = (() => {
     setPersona, setMic, toggleMic, isMicOn,
     setHandsfree, isHandsfree, isBusy,
     startCall, endCall, setMuted, isMuted,
-    pushText, flushQueue, playbackClock, setLogSink,
+    pushText, flushQueue, playbackClock, setLogSink, outputAnalyser,
     hasVideo, enableVideo, disableVideo,
     set callback(fn) { onEvent = fn; },
     get state() { return { micOn, handsfree, speaking, connected: wsReady, callActive: !!callSessionId, muted, videoOn: hasVideo() }; },

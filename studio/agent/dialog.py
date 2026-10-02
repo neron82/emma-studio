@@ -7,14 +7,20 @@ The agent receives, per turn:
 """
 from __future__ import annotations
 
+from uuid import uuid4
+
 import httpx
 
-from .. import config
+from .models import resolve_endpoint
 from .memory import load_memory
+
+_DIALOG_SESSION_ID = str(uuid4())
 
 
 class AgentError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def build_system_prompt(persona: dict, facts: list[dict], search_results: list[dict] | None = None) -> str:
@@ -43,21 +49,24 @@ def build_system_prompt(persona: dict, facts: list[dict], search_results: list[d
 
 
 async def chat(persona: dict, history: list[dict], user_message: str,
-               facts: list[dict], search_results: list[dict] | None = None) -> str:
+               facts: list[dict], search_results: list[dict] | None = None,
+               *, session_id: str | None = None) -> str:
     """One LLM turn. `history` is prior [{role, content}] without the system prompt."""
+    endpoint = resolve_endpoint(persona)
+    session_id = session_id or f"{_DIALOG_SESSION_ID}:{persona.get('id', 'default')}"
     messages = [{"role": "system", "content": build_system_prompt(persona, facts, search_results)}]
     messages += history[-12:]  # keep context bounded
     messages.append({"role": "user", "content": user_message})
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {},
-            json={"model": config.LLM_MODEL, "messages": messages},
+            f"{endpoint.base_url.rstrip('/')}/chat/completions",
+            headers=endpoint.headers(session_id),
+            json={"model": endpoint.model, "messages": messages},
         )
     if resp.status_code != 200:
-        raise AgentError(f"LLM HTTP {resp.status_code}: {resp.text[:300]}")
+        raise AgentError(f"LLM HTTP {resp.status_code}", status_code=resp.status_code)
     data = resp.json()
     try:
         return data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError) as e:
-        raise AgentError(f"LLM response malformed: {str(data)[:300]}") from e
+        raise AgentError("LLM response malformed") from e

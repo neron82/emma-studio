@@ -21,6 +21,8 @@ export class FacetimeEngine {
     this.vrm = null;
     this.renderer = null; this.scene = null; this.camera = null;
     this.canvas = null; this.fbEl = null; this.badgeEl = null;
+    this.modelName = 'emma';
+    this._frame = null;
     this.running = false;
     this.dead = false;            // shutdown() während init/Retry: Abbruch-Marker
     this._initPending = false; this._retryTimer = null; this._breath = null;
@@ -52,6 +54,22 @@ export class FacetimeEngine {
     attempt(0);
   }
 
+  /** Keep shoulders in frame even when a narrow phone viewport reduces horizontal FOV. */
+  resize() {
+    if (!this.canvas || !this.renderer || !this.camera || !this._frame) return;
+    const width = this.canvas.clientWidth, height = this.canvas.clientHeight;
+    if (!width || !height) return; // The call view may be hidden behind settings.
+    const aspect = width / height;
+    this.renderer.setSize(width, height, false);
+    this.camera.aspect = aspect;
+    this.camera.updateProjectionMatrix();
+    const frame = this._frame;
+    const distance = frame.dist * Math.max(1, Math.sqrt(0.8 / aspect));
+    this.camera.position.set(0, frame.headWorldTarget + frame.height * 0.02,
+                             (this._facingPlusZ ? 1 : -1) * distance);
+    this.camera.lookAt(0, frame.headWorldTarget - frame.height * 0.055, 0);
+  }
+
   /** Stoppt Render-Loop und (laufende) Initialisierung und gibt die
       GPU-Ressourcen frei. Ein späteres attach() startet von vorn. */
   shutdown() {
@@ -66,6 +84,7 @@ export class FacetimeEngine {
       this.renderer = null;
     }
     this.vrm = null; this.scene = null; this.camera = null;
+    this._frame = null;
   }
 
   showFallback(reason) {
@@ -73,7 +92,7 @@ export class FacetimeEngine {
     if (this.fbEl) this.fbEl.style.display = 'flex';
     // gentle breathing on the still portrait
     const img = this.fbEl && this.fbEl.querySelector('img');
-    if (img) { let t = 0;
+    if (img && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) { let t = 0;
       clearInterval(this._breath);
       this._breath = setInterval(() => { t += .05; img.style.transform = `scale(${1 + Math.sin(t) * .008})`; }, 50);
     }
@@ -86,21 +105,18 @@ export class FacetimeEngine {
     if (this.dead) return;                        // shutdown während Import — abbrechen
 
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, alpha: true });
-    this.renderer.setSize(this.canvas.clientWidth || innerWidth, this.canvas.clientHeight || innerHeight);
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(28, (this.canvas.clientWidth||innerWidth)/(this.canvas.clientHeight||innerHeight), .1, 20);
-    this.camera.position.set(0, 1.34, 1.15);
+    this.camera = new THREE.PerspectiveCamera(28, 1, .1, 20);
 
     const key = new THREE.DirectionalLight(0xfff0f5, Math.PI * .9);
     key.position.set(.8, 2, 2); this.scene.add(key);
     this.scene.add(new THREE.AmbientLight(0xffffff, .55));
     const rim = new THREE.DirectionalLight(0xe8a0bf, .5); rim.position.set(-2, 1, -1); this.scene.add(rim);
 
-    const head = await fetch('/static/avatars/emma.vrm', { method: 'HEAD' });
-    if (!head.ok) throw new Error('kein VRM');
+    const modelUrl = '/static/avatars/' + (this.modelName === 'default' ? 'default' : 'emma') + '.vrm';
     const loader = new GLTFLoader();
     loader.register(p => new VRMLoaderPlugin(p));
-    const gltf = await loader.loadAsync('/static/avatars/emma.vrm');
+    const gltf = await loader.loadAsync(modelUrl);
     this.vrm = gltf.userData.vrm;
     this.scene.add(gltf.scene);
     gltf.scene.traverse(o => { o.frustumCulled = false; });
@@ -129,8 +145,10 @@ export class FacetimeEngine {
       const height = Math.max(0.1, box.max.y - box.min.y);
       const modelMinY = box.min.y;          // origin offset of this model
       gltf.scene.updateMatrixWorld(true);
-      let headBone = null;
-      gltf.scene.traverse(o => { if (o.isBone && /head/i.test(o.name)) headBone = o; });
+      let headBone = this.vrm.humanoid?.getRawBoneNode('head');
+      if (!headBone) {
+        gltf.scene.traverse(o => { if (!headBone && o.isBone && /head/i.test(o.name)) headBone = o; });
+      }
       const v = new THREE.Vector3();
       const rawHeadY = headBone
         ? headBone.getWorldPosition(v).y
@@ -162,17 +180,11 @@ export class FacetimeEngine {
         `Blickrichtung: ${facingPlusZ ? '+Z' : '−Z'} (eye z=${eyeZ === null ? '?' : eyeZ.toFixed(2)}, head z=${headZ === null ? '?' : headZ.toFixed(2)})`
       );
 
-      // head-and-shoulders: ~25% headroom (lookAt sits slightly below eyes),
-      // camera on whichever side the face points to
-      const dist = Math.max(0.55, height * 0.5);
-      this.camera.position.set(0, headWorldTarget + height * 0.02,
-                               (facingPlusZ ? +1 : -1) * dist);
-      this.camera.lookAt(0, headWorldTarget - height * 0.055, 0);
-      this._frame = { height, headWorldTarget, dist };
+      this._frame = { height, headWorldTarget, dist: Math.max(0.55, height * 0.9) };
+      this.resize();
     }
 
-    if (this.badgeEl) this.badgeEl.textContent =
-      `VRM aktiv (${(this._frame.height).toFixed(2)}m)`;
+    if (this.badgeEl) this.badgeEl.textContent = 'Video · Avatar aktiv';
     if (this.fbEl) this.fbEl.style.display = 'none';
     this.THREE = THREE;
     this._initGaze(this._facingPlusZ);   // Kopf/Augen auf die Kamera ausrichten
@@ -378,12 +390,29 @@ export class FacetimeEngine {
   }
 
   audioLevel() {
-    const el = document.getElementById('audioOut');
-    if (!el || el.paused) return 0;
-    if (!this.analyser) return 0;
-    this.analyser.getByteFrequencyData(this.levelData);
-    let s = 0; for (let i = 2; i < 24; i++) s += this.levelData[i];
+    const an = this._activeAnalyser();
+    if (!an) return 0;
+    const level = this._spectrum(an);
+    let s = 0; for (let i = 2; i < 24; i++) s += level[i];
     return Math.min(1, (s / 22) / 140);
+  }
+
+  /** Der Analyser, der gerade wirklich Audio führt: im Anruf der Ausgang des
+      Call-Worklets, im alten Chunk-Pfad das #audioOut-Element. */
+  _activeAnalyser() {
+    const el = document.getElementById('audioOut');
+    if (this.analyser && el && !el.paused) return this.analyser;
+    return window.CallSession?.outputAnalyser?.() || null;
+  }
+
+  /** Frequenzdaten eines Analysers (eigener Puffer je Analyser). */
+  _spectrum(an) {
+    if (this._specRef !== an) {
+      this._specRef = an;
+      this._specBuf = new Uint8Array(an.frequencyBinCount);
+    }
+    an.getByteFrequencyData(this._specBuf);
+    return this._specBuf;
   }
 
   /** Vokal-Näherung fürs Lip-Sync: Der spektrale Zentroid bestimmt die
@@ -391,17 +420,17 @@ export class FacetimeEngine {
       Öffnungsgrad. Kein echtes Phonem-Tracking — aber der Mund artikuliert
       statt nur mit der Lautstärke aufzugehen. */
   mouthShape() {
-    const el = document.getElementById('audioOut');
-    if (!el || el.paused || !this.analyser) return null;
-    const sr = this.audioCtx ? this.audioCtx.sampleRate : 44100;
-    const bins = this.levelData.length;
+    const an = this._activeAnalyser();
+    if (!an) return null;
+    const level = this._spectrum(an);
+    const sr = an.context ? an.context.sampleRate : 48000;
+    const bins = level.length;
     const hzPerBin = sr / 2 / bins;
-    this.analyser.getByteFrequencyData(this.levelData);
     const bandAvg = (f0, f1) => {
       let s = 0, n = 0;
       for (let i = Math.max(1, Math.floor(f0 / hzPerBin));
            i <= Math.min(bins - 1, Math.ceil(f1 / hzPerBin)); i++) {
-        s += this.levelData[i]; n++;
+        s += level[i]; n++;
       }
       return n ? s / n / 255 : 0;
     };
@@ -412,7 +441,7 @@ export class FacetimeEngine {
     const lo = Math.max(1, Math.floor(150 / hzPerBin));
     const hi = Math.min(bins - 1, Math.ceil(3800 / hzPerBin));
     for (let i = lo; i <= hi; i++) {
-      const e = this.levelData[i] / 255;
+      const e = level[i] / 255;
       wsum += e * i; esum += e;
     }
     const centroidHz = esum > 0 ? (wsum / esum) * hzPerBin : 1000;
@@ -492,7 +521,11 @@ FacetimeEngine.prototype.loop = function () {
         }
       }
       mode = `tl:${vis.v}`;
-    } else if (!tlActive) {
+    } else {
+      // Kein Segment an dieser Position: entweder eine Lücke zwischen zwei
+      // Segmenten oder die Timeline ist zu Ende bzw. fehlt (z.B. weil der
+      // Server für diesen Satz keine schicken konnte). NICHT den Mund
+      // schließen — sonst steht die Lippe für den Rest der Antwort still.
       const shape = this.mouthShape();
       if (shape) { Object.assign(target, shape); mode = 'formant'; }
     }

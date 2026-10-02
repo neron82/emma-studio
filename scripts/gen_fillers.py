@@ -8,7 +8,6 @@ backchannel selector at dialog time.
 import json
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent

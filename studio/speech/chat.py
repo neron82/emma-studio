@@ -183,19 +183,13 @@ class Chat:
                 entry.status = "completed" if status is None else status
                 return
 
-    def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
+    def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
 
-        Also marks the paired ``function_call`` as ``"completed"`` if its
-        status was ``None``.
-
-        Raises :class:`ChatItemError` if *call_id* is unknown.
+        Also marks the paired ``function_call`` as ``"completed"`` if its status
+        was ``None``. Raises :class:`ChatItemError` if *call_id* is unknown.
+        Caller must hold ``_lock``.
         """
-        with self._lock:
-            self._append_tool_output_locked(call_id, output_item)
-
-    def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
-        """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
             self._pending_tool_calls.pop(call_id, None)
             self._mark_call_completed(call_id, output_item.status)
@@ -213,10 +207,6 @@ class Chat:
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
-
-    def init_chat(self, message: RealtimeConversationItemSystemMessage) -> None:
-        with self._lock:
-            self.init_chat_message = message
 
     def history_anchor_id(self) -> str | None:
         """Anchor identifying the current end of the conversation.
@@ -1066,7 +1056,7 @@ class Chat:
     ) -> None:
         """Splice the summary in front of items not consumed by compaction.
 
-        FC/FCO pairing is left entirely to :meth:`add_item` / :meth:`append_tool_output`.
+        FC/FCO pairing is left entirely to :meth:`add_item`.
         Compaction only drops items; it never inserts an FC into the buffer.
         Pending FCs (no FCO yet) stay in ``_pending_tool_calls``. Serializer
         snapshots pair completed calls and outputs without reordering this buffer.

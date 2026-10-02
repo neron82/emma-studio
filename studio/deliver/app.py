@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,8 +37,14 @@ from fastapi.staticfiles import StaticFiles
 from .. import config
 from ..core.store import Store
 from ..agent.memory import schedule_call_finalization
+from ..agent.models import (
+    ModelConfigurationError, ModelDiscoveryError, discover_models, validate_selection,
+)
 from ..core import pipeline
 from ..speech import engine
+from ..speech import vlm
+from ..speech.core.log_context import PipelineLogFilter
+from ..speech.core.transcript_logging import set_log_transcripts, warn_if_log_transcripts_enabled
 from .realtime.websocket_router import register_realtime, SESSION_END_QUARANTINE_TIMEOUT_S
 
 _rt_holder: dict[str, Any] = {}
@@ -45,8 +52,17 @@ _rt_holder: dict[str, Any] = {}
 # Logging: Bibliotheken bleiben bei WARNING, Emmas eigene Logger auf INFO
 # (STUDIO_LOG_LEVEL steuert es). Ohne das verschwinden genau die Zeilen, die
 # erklären was der Dialog sieht — z. B. der injizierte Blickkontext.
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.WARNING, format="%(pipeline_prefix)s" + logging.BASIC_FORMAT)
 logging.getLogger("studio").setLevel(os.getenv("STUDIO_LOG_LEVEL", "INFO").upper())
+# The pipeline-log filter must sit on the handlers, not on the root logger:
+# records propagating up from child loggers bypass ancestor logger filters.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(PipelineLogFilter())
+# Privacy gate: conversation content only reaches the logs when explicitly
+# opted in (STUDIO_LOG_TRANSCRIPTS=1 / --log_transcripts); otherwise every
+# transcript log site reports a character count instead of the text.
+set_log_transcripts(os.getenv("STUDIO_LOG_TRANSCRIPTS") == "1")
+warn_if_log_transcripts_enabled()
 logger = logging.getLogger("studio")
 
 
@@ -91,12 +107,11 @@ async def facetime_page() -> str:
 
 
 @app.get("/api/personas/portrait")
-async def persona_portrait():
-    """Portrait of the first persona with a ref image — facetime fallback."""
-    for p in store.list_personas():
-        if p.get("ref_image") and Path(p["ref_image"]).is_file():
-            media = "image/png" if p["ref_image"].endswith(".png") else "image/jpeg"
-            return FileResponse(p["ref_image"], media_type=media)
+async def persona_portrait(persona_id: str):
+    """Return only the selected persona's portrait, never another persona's."""
+    p = store.get_persona(persona_id)
+    if p and p.get("ref_image") and Path(p["ref_image"]).is_file():
+        return FileResponse(p["ref_image"])
     raise HTTPException(404, "no persona portrait")
 
 
@@ -136,7 +151,7 @@ async def pick_filler_endpoint(payload: dict):
     if not entry:
         return {"url": None}
     return {
-        "url": f"/api/fillers/audio/{entry['file'].split('/', 1)[1]}",
+        "url": backchannel.filler_url(entry),
         "phrase": entry["phrase"],
         "category": entry["category"],
         "duration_s": entry["duration_s"],
@@ -170,6 +185,16 @@ async def api_stt(audio: UploadFile = File(...)):
     return {"text": text}
 
 
+@app.get("/api/models")
+async def list_models(provider: str = "configured", base_url: str = ""):
+    try:
+        return await discover_models(provider, base_url)
+    except ModelConfigurationError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except ModelDiscoveryError as exc:
+        raise HTTPException(502, str(exc)) from None
+
+
 # -- personas ---------------------------------------------------------------
 
 @app.get("/api/personas")
@@ -180,18 +205,34 @@ async def list_personas():
 @app.post("/api/personas")
 async def create_persona(name: str = Form(...), personality_prompt: str = Form(""),
                          language: str = Form("German"), vrm_model: str = Form(""),
-                         silent_summary: str = Form("on"), silent_ratio: float = Form(0.8)):
+                         silent_summary: str = Form("on"), silent_ratio: float = Form(0.8),
+                         llm_provider: str = Form("configured"),
+                         llm_base_url: str = Form(""), llm_model: str = Form("")):
+    try:
+        selection = validate_selection({"llm_provider": llm_provider,
+                                        "llm_base_url": llm_base_url,
+                                        "llm_model": llm_model})
+    except ModelConfigurationError as exc:
+        raise HTTPException(400, str(exc)) from None
     p = store.create_persona(name, personality_prompt=personality_prompt,
                              language=language, vrm_model=vrm_model or None,
-                             silent_summary=silent_summary, silent_ratio=silent_ratio)
+                             silent_summary=silent_summary, silent_ratio=silent_ratio,
+                             **selection)
     return p
 
 
 @app.patch("/api/personas/{persona_id}")
 async def update_persona(persona_id: str, payload: dict):
-    p = store.update_persona(persona_id, **payload)
-    if not p:
+    current = store.get_persona(persona_id)
+    if not current:
         raise HTTPException(404, "persona not found")
+    if {"llm_provider", "llm_base_url", "llm_model"} & payload.keys():
+        try:
+            selection = validate_selection({**current, **payload})
+        except ModelConfigurationError as exc:
+            raise HTTPException(400, str(exc)) from None
+        payload = {**payload, **selection}
+    p = store.update_persona(persona_id, **payload)
     return p
 
 
@@ -229,11 +270,10 @@ async def create_call_turn(persona_id: str = Form(...), message: str = Form(...)
     return job
 
 
-
 @app.get("/api/history/{persona_id}")
 async def get_history(persona_id: str, limit: int = 50):
     """Persistent conversation log — survives reloads."""
-    return store.get_history(persona_id, limit=limit)
+    return store.get_history(persona_id, limit=limit, transport="facetime")
 
 
 async def _run_turn_and_remember(persona_id: str, job: dict, history: list[dict]):
@@ -268,7 +308,6 @@ async def job_audio(job_id: str):
 @app.get("/api/jobs/{job_id}/chunks")
 async def job_chunks(job_id: str):
     """List sentence-chunk audio files for sequential playback."""
-    from pathlib import Path as _P
     d = config.DATA_DIR / "jobs" / job_id
     if not d.is_dir():
         return []
@@ -321,15 +360,51 @@ async def delete_fact(fact_id: str):
 
 # -- calls (facetime call sessions) ------------------------------------------
 
+def _live_call_conn(session_id: str) -> str | None:
+    """conn_id einer aktuell an *session_id* gebundenen Realtime-Verbindung."""
+    for unit in list(_rt_pool):
+        svc = getattr(unit, "service", None)
+        if svc is None:
+            continue
+        conn_id = svc.conn_for_call_session(session_id)
+        if conn_id is not None:
+            return conn_id
+    return None
+
+
 @app.post("/api/calls/start")
 async def start_call(payload: dict):
-    """Neuen Facetime-Call starten: Session, die alle ihre Messages taggt."""
+    """Neuen Facetime-Call starten: Session, die alle ihre Messages taggt.
+
+    ``video: true`` (der Client kennt die Modalität, bevor der erste Frame
+    kommt) lädt den VLM im Hintergrund vor. Sein Kaltstart dauert ~8-15 s und
+    blockiert das geteilte Gerät — mitten in einem Turn hat er den Anruf schon
+    einmal abgerissen (siehe ``speech/core/device_lock.py``).
+    """
     persona_id = payload.get("persona_id")
     if not persona_id or store.get_persona(persona_id) is None:
         raise HTTPException(400, "unknown persona_id")
-    for session in store.list_sessions(persona_id=persona_id, limit=50):
-        if session["state"] == "active":
-            raise HTTPException(409, {"detail": "persona already has an active call", "session": session})
+    for session in store.list_sessions(persona_id=persona_id, limit=50, transport="facetime"):
+        if session["state"] != "active":
+            continue
+        # Aktive Session ohne lebende Verbindung = Überrest: der Prozess ist
+        # gestorben (Absturz/Restart) oder der Tab verschwand ohne Auflegen.
+        # Nach der Schonfrist (der Client baut die WS erst nach dem Start auf)
+        # wird sie abgeschlossen — sonst sperrt sie die Persona für immer aus
+        # jedem weiteren Anruf.
+        age = time.time() - float(session.get("started_at") or 0)
+        if _live_call_conn(session["id"]) is None and age > config.STALE_CALL_GRACE_S:
+            logger.warning(
+                "Call %s: aktiv seit %.0fs ohne Verbindung — wird abgeschlossen (Überrest)",
+                session["id"], age,
+            )
+            row = store.finalize_session_now(session["id"])
+            if row is not None:
+                schedule_call_finalization(store, row)
+            continue
+        raise HTTPException(409, {"detail": "persona already has an active call", "session": session})
+    if payload.get("video"):
+        vlm.warmup()
     return store.create_session(persona_id)
 
 
@@ -365,7 +440,7 @@ async def _wait_call_release(session_id: str, timeout: float | None = None) -> b
 async def end_call(payload: dict):
     """Auflegen: Session finalisieren + Memory-Zusammenfassung planen (exakt einmal)."""
     session = store.get_session(str(payload.get("session_id", "")))
-    if session is None:
+    if session is None or session["transport"] != "facetime":
         raise HTTPException(404, "unknown session_id")
     released = await _wait_call_release(session["id"])
     if not released:
@@ -378,15 +453,15 @@ async def end_call(payload: dict):
 
 @app.get("/api/sessions")
 async def list_sessions(persona_id: str | None = None, limit: int = 50):
-    """Call-Sessions (neueste zuerst), optional nach Persona gefiltert."""
-    return store.list_sessions(persona_id=persona_id, limit=limit)
+    """Facetime call sessions (newest first), optionally filtered by persona."""
+    return store.list_sessions(persona_id=persona_id, limit=limit, transport="facetime")
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     """Session inkl. Transcript (User + Avatar, ohne VLM-Beschreibungen)."""
     session = store.get_session(session_id)
-    if session is None:
+    if session is None or session["transport"] != "facetime":
         raise HTTPException(404, "unknown session_id")
     return {"session": session, "messages": store.session_transcript(session_id)}
 

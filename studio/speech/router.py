@@ -12,9 +12,6 @@ unreachable. Call turns never reach this router (audio-only).
 """
 from __future__ import annotations
 
-import httpx
-
-from .. import config
 from .tts import health as tts_health
 
 

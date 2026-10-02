@@ -13,7 +13,6 @@ Run: python3 tests/avatar_functional.py
 import json
 import subprocess
 import sys
-import time
 
 BASE = "http://127.0.0.1:8890"
 
@@ -67,22 +66,6 @@ FPS_PROBE = """
 """
 
 
-def run_js(js: str, budget_ms: int = 20000) -> dict:
-    html = f"""<!DOCTYPE html><html><body><script>
-    window.__result = null;
-    Promise.resolve({js}).then(r => window.__result = r)
-      .catch(e => window.__result = {{error: String(e)}});
-    </script></body></html>"""
-    p = subprocess.run(
-        ["google-chrome", "--headless=new", "--disable-gpu", "--no-sandbox",
-         f"--virtual-time-budget={budget_ms}", "--dump-dom",
-         "data:text/html," + json.dumps(html)],
-        capture_output=True, text=True, timeout=120,
-    )
-    # virtual time + data URL with scripts is unreliable; use a temp file instead
-    return {}
-
-
 def run_via_app_page(js: str, name: str, budget_ms: int = 25000) -> dict:
     """Run a JS probe against the REAL facetime page (same origin, importmap
     already present). Injects the probe and reads back the result element."""
@@ -92,7 +75,7 @@ def run_via_app_page(js: str, name: str, budget_ms: int = 25000) -> dict:
     probe_js_path.write_text(js, encoding="utf-8")
     # copy into the app's static dir so it's served same-origin
     app_static = Path.home() / "projects/emma-studio/web/static/js/_probe.js"
-    app_static.write_text(f"""
+    app_static.write_text("""
 fetch('/static/js/_probe.js').then(r=>r.text()).then(code => eval(code));
 """, encoding="utf-8")
     # simpler: write result-collector page INTO static dir, then load via app origin

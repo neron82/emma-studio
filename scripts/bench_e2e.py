@@ -11,6 +11,7 @@ Output: console table + JSON at data/benchmarks/e2e_latency.json
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import sys
 import time
@@ -19,11 +20,9 @@ from pathlib import Path
 import httpx
 
 BASE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE))
 
-from studio import config  # noqa: E402
-
-API = f"http://127.0.0.1:{config.STUDIO_PORT}" if hasattr(config, "STUDIO_PORT") else "http://127.0.0.1:8890"
+# The HTTP app defaults to :8890; STUDIO_BASE_URL overrides for other setups.
+API = os.environ.get("STUDIO_BASE_URL", "http://127.0.0.1:8890").rstrip("/")
 PERSONA_ID = "bb8b992fc5b1"
 N_TURNS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 
@@ -81,6 +80,7 @@ def main() -> None:
             "state": j["state"],
             "wall_s": round(wall_s, 2),
             "facts_ms": timings.get("facts", 0) * 1000,
+            "filler_pick_ms": round(filler_pick_ms, 1),
             "search_ms": (timings.get("search") or 0) * 1000,
             "llm_ms": timings.get("llm", 0) * 1000,
             "tts_first_s": tts_first,

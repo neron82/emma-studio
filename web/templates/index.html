@@ -2,468 +2,348 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Emma Studio</title>
-<link rel="stylesheet" href="/static/studio.css?v=5">
-<script type="importmap">
-{"imports":{"three":"/static/vendor/three.module.js"}}
-</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f5f5f7">
+<title>Emma Studio · Anrufe</title>
+<link rel="stylesheet" href="/static/studio.css?v=7">
+<script type="importmap">{"imports":{"three":"/static/vendor/three.module.js"}}</script>
 <script src="/static/js/debug-console.js?v=1"></script>
 <script src="/static/js/backchannel.js?v=1"></script>
-<script src="/static/js/call-session.js?v=7"></script>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎭</text></svg>">
+<script src="/static/js/call-session.js?v=10"></script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='17' fill='%2327ae60'/%3E%3Cpath d='M16 22h22v20H16zM38 28l12-6v20l-12-6' fill='white'/%3E%3C/svg%3E">
 </head>
 <body>
 <div class="shell">
-
-  <div class="main">
-    <header class="topbar">
-      <div class="brand top"><div class="brand-dot">E</div><span>Emma <em>Studio</em></span></div>
-      <div class="svc-row top"><div class="svc-dot" id="svc-omni"></div><span class="nm">OmniVoice</span></div>
-      <div class="svc-row top"><div class="svc-dot" id="svc-comfy"></div><span class="nm">ComfyUI</span></div>
-      <h2 id="viewTitle">Facetime</h2>
-      <span class="spacer"></span>
-      <button class="nav-item top" data-view="facts" onclick="go('facts')"><span class="ico">🧠</span><span class="lbl">Wissen</span></button>
-      <button class="nav-item top" data-view="personas" onclick="go('personas')"><span class="ico">🧝‍♀️</span><span class="lbl">Personas</span></button>
-      <div class="persona-chip">
-        <button class="icon-btn" id="pipeToggle" title="Pipeline-Status (Alt+P)">📊</button>
-        <img class="persona-avatar" id="topAvatar" src="/api/personas/portrait" onerror="this.style.visibility='hidden'">
-        <select id="persona" style="width:auto;background:none;border:none;color:var(--text);font:inherit;padding:0" onchange="onPersonaSwitch()"></select>
+  <aside class="sidebar" aria-label="Hauptnavigation">
+    <a class="brand" href="#facetime" onclick="go('facetime');return false"><span class="brand-mark" data-icon="video"></span><span>Emma<span class="brand-sub">Studio</span></span></a>
+    <nav class="primary-nav" aria-label="Bereiche">
+      <button class="nav-item" data-view="facetime" aria-label="Anrufe" onclick="go('facetime')"><span data-icon="phone"></span><span>Anrufe</span><span class="live-dot hidden" id="liveDot"></span></button>
+      <button class="nav-item" data-view="facts" aria-label="Wissen" onclick="go('facts')"><span data-icon="book"></span><span>Wissen</span></button>
+      <button class="nav-item" data-view="personas" aria-label="Einstellungen" onclick="go('personas')"><span data-icon="settings"></span><span>Einstellungen</span></button>
+    </nav>
+    <section class="contact-section" aria-label="Gesprächspartner">
+      <label class="section-label" for="persona">DEIN KONTAKT</label>
+      <div class="contact-card">
+        <div class="contact-avatar" id="topAvatar"></div>
+        <select id="persona" aria-label="Persona auswählen" onchange="onPersonaSwitch()"></select>
+        <p id="contactNote">Dein persönlicher KI-Kontakt</p>
       </div>
-    </header>
-
-    <div class="content">
+      <button class="text-button contact-edit" onclick="go('personas')">Persona anpassen <span data-icon="arrow"></span></button>
+    </section>
+    <div class="sidebar-footer"><span class="footer-mark" data-icon="wave"></span><p>Ein Gespräch.<br><strong>Ganz persönlich.</strong></p><span class="footer-note">Audio &amp; Video mit deiner KI</span></div>
+  </aside>
+  <main class="main" id="main">
+    <div id="callView" class="call-view"></div>
+    <div id="pageView" class="page-view hidden">
+      <header class="page-header"><button class="back-button" onclick="go('facetime')"><span data-icon="back"></span><span>Zurück zu Anrufen</span></button><span id="activeCallNote" class="hidden">Anruf läuft weiter</span></header>
       <div class="view" id="view"></div>
     </div>
-  </div>
-
+  </main>
 </div>
-<div id="toast"></div>
-
-<!-- Pipeline-Status: zeigt durchlaufend, welcher Teil gerade arbeitet -->
-<div id="pipeOverlay">
-  <div class="pipe-head">
-    <b>Pipeline-Status</b>
-    <span class="muted" id="pipeCount">0 Zeilen</span>
-    <span class="spacer"></span>
-    <button class="icon-btn" id="pipeClear" title="Leeren">🧹</button>
-    <button class="icon-btn" id="pipeClose" title="Schließen (Alt+P)">✕</button>
-  </div>
+<div id="toast" role="status" aria-live="polite"></div>
+<section id="pipeOverlay" aria-label="Pipeline-Diagnose" inert>
+  <div class="pipe-head"><b>Pipeline-Diagnose</b><span class="muted" id="pipeCount">0 Zeilen</span><span class="spacer"></span><button class="icon-btn" id="pipeClear" aria-label="Diagnose leeren" data-icon="trash"></button><button class="icon-btn" id="pipeClose" aria-label="Diagnose schließen" data-icon="close"></button></div>
   <div class="pipe-log" id="pipeLog"><div class="ln empty">Noch keine Meldungen.</div></div>
-</div>
-<audio id="audioOut" style="display:none"></audio>
-
+</section>
+<audio id="audioOut" hidden></audio>
 <script>
-/* ================= app shell ================= */
 const $ = id => document.getElementById(id);
-let personas = [], currentView = null, personaId = null;
-
-const VIEWS = {
-  facetime: {title:'Facetime', render: renderFacetime},
-  personas: {title:'Personas', render: renderPersonas},
-  facts:    {title:'Wissen', render: renderFacts},
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const icons = {
+ video:'<rect x="3" y="5" width="12" height="14" rx="3"/><path d="m15 9 6-3v12l-6-3"/>',
+ phone:'<path d="M8 3H4a1 1 0 0 0-1 1c0 9.4 7.6 17 17 17a1 1 0 0 0 1-1v-4l-5-2-2 2a14 14 0 0 1-6-6l2-2-2-5Z"/>',
+ end:'<path d="M3 15v-4c5-5 13-5 18 0v4h-5v-4a13 13 0 0 0-8 0v4H3Z"/>',
+ mic:'<rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/>',
+ micOff:'<path d="m3 3 18 18M9 9v3a3 3 0 0 0 5 2M9 5a3 3 0 0 1 6 0v4M5 10v2a7 7 0 0 0 12 5M19 10v2M12 19v3M8 22h8"/>',
+ cameraOff:'<path d="m3 3 18 18M7 5h5a3 3 0 0 1 3 3v1l6-3v12l-3-2M15 15v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V8"/>',
+ book:'<path d="M12 5v16M12 5C9 3 5 3 2 4v15c3-1 7-1 10 2 3-3 7-3 10-2V4c-3-1-7-1-10 1Z"/>',
+ settings:'<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>',
+ arrow:'<path d="m9 5 7 7-7 7"/>', back:'<path d="m14 5-7 7 7 7M7 12h14"/>', close:'<path d="m6 6 12 12M6 18 18 6"/>',
+ text:'<path d="M5 3h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9l-6 3V5a2 2 0 0 1 2-2ZM7 8h10M7 12h7"/>',
+ plus:'<path d="M12 5v14M5 12h14"/>', upload:'<path d="M12 16V3m-5 5 5-5 5 5M4 15v5h16v-5"/>',
+ trash:'<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
+ wave:'<path d="M3 10v4M7 6v12M12 3v18M17 6v12M21 10v4"/>', send:'<path d="m5 12 7-7 7 7M12 5v15"/>',
+ tools:'<path d="M4 18V9M10 18V4M16 18v-6M22 18V7"/>'
 };
-
-function toast(msg, isErr){
-  const t=$('toast'); t.textContent=msg; t.classList.toggle('error',!!isErr); t.classList.add('show');
-  clearTimeout(t._to); t._to=setTimeout(()=>t.classList.remove('show'), 2600);
-}
-async function api(path, opts){ const r=await fetch(path,opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-
-function go(view){
-  if(!VIEWS[view]) view='facetime';
-  currentView=view;
-  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active', n.dataset.view===view));
-  $('viewTitle').textContent=VIEWS[view].title;
-  VIEWS[view].render();
-  history.replaceState(null,'','#'+view);
-}
-
-function onPersonaSwitch(){
-  personaId=$('persona').value;
-  localStorage.setItem('studioPersona', personaId);
-  if(currentView) VIEWS[currentView].render();
-}
-
-function currentPersona(){ return personas.find(p=>p.id===personaId); }
-
-/* ================= pipeline status overlay ================= */
-/* Zeigt durchlaufend, welcher Teil der Pipeline arbeitet. Quellen:
-   (1) Server-Statuszeilen (emma.status → VLM/STT/PROMPT/LM/TTS/RESP) und
-   (2) die Client-Meldungen aus CallSession (Mikrofon, Frames, Playback …). */
-const PipeLog = (() => {
-  const MAX = 400;
-  const box = $('pipeLog'), overlay = $('pipeOverlay'), counter = $('pipeCount');
-  let lines = 0;
-
-  function stageOf(msg) {
-    const m = /^\[([A-ZÄÖÜ]+)\]/.exec(msg) || /^([A-Z]{2,6})\b/.exec(msg);
-    return m ? m[1] : '';
-  }
-
-  function add(msg) {
-    if (!box) return;
-    if (lines === 0) box.innerHTML = '';
-    const st = stageOf(msg);
-    const el = document.createElement('div');
-    el.className = 'ln';
-    const nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-    el.innerHTML = `<span class="ts"></span><span class="st ${st}"></span><span class="txt"></span>`;
-    el.children[0].textContent = new Date().toLocaleTimeString('de-DE');
-    el.children[1].textContent = st || '·';
-    el.children[2].textContent = st ? msg.replace(/^\[[A-ZÄÖÜ]+\]\s*/, '') : msg;
-    box.appendChild(el);
-    lines++;
-    while (box.children.length > MAX) box.removeChild(box.firstChild);
-    if (counter) counter.textContent = lines + ' Zeilen';
-    if (nearBottom || lines < 3) box.scrollTop = box.scrollHeight;
-  }
-
-  function toggle(force) {
-    const open = force !== undefined ? force : !overlay.classList.contains('open');
-    overlay.classList.toggle('open', open);
-    document.body.classList.toggle('pipe-open', open);
-    if (open) box.scrollTop = box.scrollHeight;
-  }
-
-  window.addEventListener('keydown', e => {
-    if (e.altKey && (e.key === 'p' || e.key === 'P')) { e.preventDefault(); toggle(); }
-  });
-  $('pipeToggle').onclick = () => toggle();
-  $('pipeClose').onclick = () => toggle(false);
-  $('pipeClear').onclick = () => { lines = 0; box.innerHTML = '<div class="ln empty">geleert</div>'; if (counter) counter.textContent = '0 Zeilen'; };
-
-  return { add, toggle };
-})();
-
-// CallSession meldet hier ihre Client-Ereignisse (Mikrofon, Frames, Playback …)
-if (window.CallSession && CallSession.setLogSink) CallSession.setLogSink(msg => PipeLog.add(msg));
-
-
-/* ================= Facetime view ================= */
-function renderFacetime(){
-  $('view').innerHTML = `
-    <div class="call-stage ft">
-      <div class="stage-wrap" id="ftStage">
-        <canvas id="vrmCanvas" class="veiled"></canvas>
-        <div class="fallback-portrait" id="fbPortrait">
-          <img src="/api/personas/portrait" alt="" onerror="this.parentElement.innerHTML='<div class=empty-hint>Kein Portrait hinterlegt</div>'">
-        </div>
-        <span class="stage-badge status-pill" id="engineBadge">Audio</span>
-      </div>
-      <div class="call-status" id="ftStatus">Bereit</div>
-      <div class="call-timer hidden" id="ftTimer">00:00</div>
-
-      <div class="transcript-fab">
-        <button class="icon-btn" id="txToggleFt" title="Transkript">📄</button>
-        <div class="transcript-panel hidden" id="txPanelFt">
-          <div class="chat-log" id="chatLog"><div class="empty-hint">Transkript leer.</div></div>
-        </div>
-      </div>
-
-      <div class="ft-callbar" id="ftCallBar">
-        <button class="ft-btn audio" id="ftAudio" title="Anrufen (Audio)"><span>📞</span></button>
-        <button class="ft-btn video" id="ftVideo" title="Video-Call: Kamera + Avatar"><span>🎥</span></button>
-        <button class="ft-btn mute hidden" id="ftMute" title="Stummschalten"><span>🎙️</span></button>
-        <button class="ft-btn hangup hidden" id="ftHangup" title="Auflegen"><span>📞</span></button>
-      </div>
-      <div class="composer">
-        <input type="text" id="ftMsg" placeholder="sag etwas… (Enter)">
-        <button class="btn" id="ftSend">Senden</button>
-      </div>
-    </div>`;
-  attachFtEngine();                       // nach Persona-Switch: an neue Elemente anbinden
-  bindCallEngine();
-  $('ftSend').onclick=()=>{ const t=$('ftMsg').value.trim(); if(t){$('ftMsg').value=''; CallSession.pushText(t, true);} };
-}
-
-/* ================= Facetime call bar (Call / Mute / Hang-up) ================= */
-let ftCallTimerId=null;
-function setFtCallUI(inCall){
-  const audio=$('ftAudio'), video=$('ftVideo'), mute=$('ftMute'), hangup=$('ftHangup'), timer=$('ftTimer');
-  if(!audio) return;
-  audio.classList.toggle('hidden', inCall);
-  video.classList.toggle('hidden', inCall);
-  mute.classList.toggle('hidden', !inCall);
-  hangup.classList.toggle('hidden', !inCall);
-  if(timer) timer.classList.toggle('hidden', !inCall);
-  if(mute) mute.classList.remove('muted');
-}
-function ftCallTimer(startedAt){
-  stopFtCallTimer();
-  const t0 = startedAt || Date.now();
-  const el = $('ftTimer');
-  const tick=()=>{
-    if(!CallSession.state.callActive) return;
-    const s=Math.max(0, Math.floor((Date.now()-t0)/1000));
-    const mm=String(Math.floor(s/60)).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
-    if(el) el.textContent = mm+':'+ss;
-  };
-  tick(); ftCallTimerId=setInterval(tick,1000);
-}
-function stopFtCallTimer(){ if(ftCallTimerId){ clearInterval(ftCallTimerId); ftCallTimerId=null; } }
-/** enterFtCall/exitFtCall: thin aliases so the event switch stays readable. */
-function enterFtCall(at){ setFtCallUI(true); ftCallTimer(at); }
-function exitFtCall(){ stopFtCallTimer(); setFtCallUI(false); }
-
+function icon(name){ return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name]||icons.settings}</svg>`; }
+function paintIcons(root=document){ root.querySelectorAll('[data-icon]').forEach(el=>el.innerHTML=icon(el.dataset.icon)); }
+let personas=[], personaId=null, currentView=null, portraitVersion=Date.now();
+let callStatus='Bereit für ein Gespräch', callStartedAt=null, callBusy=false, endingCall=false, videoBusy=false, personaBusy=false;
 let ftEngine=null, ftEngineInit=null, ftVideoActive=false, videoGen=0;
-function attachFtEngine(){
-  const cv=$('vrmCanvas'), fb=$('fbPortrait'), b=$('engineBadge');
-  if(ftEngine && cv) ftEngine.attach(cv, fb, b);   // idempotent
+const historyCache=new Map();
+function currentPersona(){ return personas.find(p=>p.id===personaId); }
+function portraitURL(id){ return '/api/personas/portrait?persona_id='+encodeURIComponent(id||'')+'&v='+portraitVersion; }
+function initials(name){ return String(name||'KI').trim().split(/\s+/).slice(0,2).map(n=>Array.from(n)[0]||'').join('').toUpperCase(); }
+function portrait(p, cls=''){ return `<span class="portrait ${cls}"><span class="initials" aria-hidden="true">${esc(initials(p?.name))}</span>${p?.id?`<img src="${esc(portraitURL(p.id))}" alt="" onerror="this.remove()">`:''}</span>`; }
+function toast(msg, isErr=false){ const t=$('toast'); t.textContent=msg; t.classList.toggle('error',isErr); t.classList.add('show'); clearTimeout(t._to); t._to=setTimeout(()=>t.classList.remove('show'),4000); }
+async function api(path, opts){ const r=await fetch(path,opts); if(!r.ok){ let message='Anfrage fehlgeschlagen ('+r.status+')'; try{ const d=await r.json(); message=typeof d.detail==='string'?d.detail:message; }catch{} throw new Error(message); } return r.json(); }
+function reportError(e){ toast(e.message||String(e),true); }
+function go(view){
+  if(!['facetime','personas','facts'].includes(view)) view='facetime';
+  stopModelPicker();
+  currentView=view; document.body.dataset.view=view;
+  document.querySelectorAll('.nav-item').forEach(n=>{ const active=n.dataset.view===view; n.classList.toggle('active',active); if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current'); });
+  $('callView').classList.toggle('hidden',view!=='facetime'); $('pageView').classList.toggle('hidden',view==='facetime');
+  if(view==='facetime'){ if(!$('ftStage')) renderFacetime(); syncCallUI(); }
+  else if(view==='personas') renderPersonas(); else renderFacts();
+  document.title='Emma Studio · '+({facetime:'Anrufe',personas:'Einstellungen',facts:'Wissen'}[view]);
+  if(location.hash!=='#'+view)history.pushState(null,'','#'+view); paintIcons();
 }
-function ensureFtEngine(){
-  if(!ftEngineInit){
-    ftEngineInit = import('/static/js/facetime-engine.js?v=5').then(m=>{
-      ftEngine=new m.FacetimeEngine();
-      attachFtEngine();
-      window._ftEngine = ftEngine;
-      return ftEngine;
-    }).catch(e=>{
-      const b=$('engineBadge'); if(b) b.textContent='Fallback';
-      throw e;
-    });
-  }
-  return ftEngineInit;
+function onPersonaSwitch(){
+  if(CallSession.state.callActive||callBusy||endingCall||personaBusy){ $('persona').value=personaId; return; }
+  personaId=$('persona').value; localStorage.setItem('studioPersona',personaId); CallSession.setPersona(personaId);
+  callStatus='Bereit für ein Gespräch'; updateContact(); renderFacetime(); if(currentView!=='facetime') go(currentView);
 }
-
-/** Video-Modus: Emma als Avatar (VRM) statt Portrait. Lazy — der erste Klick
-    lädt den Renderer; weiter schaltet er sofort. Idempotent, und der Call
-    selbst bleibt von der Moduswahl unberührt (Kamera/VRM dazuschalten). */
-function setFtVideo(on){
-  if(ftVideoActive === on) return;
-  const cv=$('vrmCanvas'), b=$('engineBadge');
-  $('ftVideo').classList.toggle('on', on);
-  $('ftAudio').classList.toggle('on', !on && CallSession.state.callActive);
-  if(on){
-    ftVideoActive = true;
-    const gen = ++videoGen;
-    if(b) b.textContent='Avatar lädt…';
-    CallSession.enableVideo().then(ok=>{
-      if(!ok || gen !== videoGen || !ftVideoActive) return;   // Kamera weg oder schon deaktiviert
-      ensureFtEngine();
-      revealFtAvatar();
-    });
-  } else {
-    ftVideoActive = false;
-    videoGen++;
-    CallSession.disableVideo();
-    if(ftEngine) ftEngine.shutdown();
-    if(cv) cv.classList.add('veiled');
-    const fb=$('fbPortrait'); if(fb) fb.style.display='flex';
-    if(b) b.textContent='Audio';
-  }
+function updateContact(){
+  const p=currentPersona(); $('topAvatar').innerHTML=portrait(p); $('persona').value=personaId||'';
+  $('contactNote').textContent=CallSession.state.callActive?'Im Gespräch · Persona gesperrt':'Dein persönlicher KI-Kontakt';
 }
-
-/** Vorhang fällt, sobald das VRM wirklich gerendert werden kann. */
+const PipeLog=(()=>{
+  const box=$('pipeLog'), overlay=$('pipeOverlay'); let lines=0;
+  function add(msg){ if(!lines)box.replaceChildren(); const row=document.createElement('div');row.className='ln';const time=document.createElement('span');time.className='ts';time.textContent=new Date().toLocaleTimeString('de-DE');const text=document.createElement('span');text.textContent=msg;row.append(time,text);box.append(row);lines++;while(box.children.length>400)box.firstChild.remove();$('pipeCount').textContent=lines+' Zeilen';box.scrollTop=box.scrollHeight; }
+  function toggle(force){const open=force??!overlay.classList.contains('open');overlay.classList.toggle('open',open);overlay.inert=!open;if(open)$('pipeClose').focus();}
+  $('pipeClose').onclick=()=>toggle(false);$('pipeClear').onclick=()=>{lines=0;box.textContent='Noch keine Meldungen.';$('pipeCount').textContent='0 Zeilen';};
+  window.addEventListener('keydown',e=>{if(e.altKey&&e.key.toLowerCase()==='p'){e.preventDefault();toggle();}if(e.key==='Escape')toggle(false);});return {add,toggle};
+})();
+CallSession.setLogSink(msg=>PipeLog.add(msg));
+function renderFacetime(){
+  const p=currentPersona();
+  $('callView').innerHTML=`<section class="call-stage" aria-label="Anruf mit ${esc(p?.name||'deiner Persona')}">
+    <div class="stage-wrap" id="ftStage"><div class="fallback-portrait" id="fbPortrait">${portrait(p,'stage-portrait')}</div><canvas id="vrmCanvas" class="veiled"></canvas></div>
+    <div class="stage-shade"></div>
+    <header class="call-heading"><span class="eyebrow">DEIN MOMENT. DEIN GESPRÄCH.</span><h1>${esc(p?.name||'Willkommen')}</h1><div class="call-state"><span class="call-status" id="ftStatus" role="status"></span><span class="call-timer hidden" id="ftTimer"></span></div></header>
+    <span class="stage-badge" id="engineBadge">KI-Kontakt · Audio &amp; Video</span>
+    <div class="call-bottom"><p class="call-hint" id="callHint">Einfach anrufen. Und ganz du selbst sein.</p><div class="control-dock" aria-label="Anrufsteuerung">
+      <div class="dial-actions" id="dialActions"><button class="dial-button video" id="ftVideo">${icon('video')}<span>Videoanruf</span></button><button class="dial-button audio" id="ftAudio">${icon('phone')}<span>Audio</span></button></div>
+      <div class="active-actions hidden" id="activeActions"><button class="call-control" id="ftMute" aria-pressed="false"></button><button class="call-control" id="ftCamera" aria-pressed="false"></button><button class="call-control hangup" id="ftHangup">${icon('end')}<span>Beenden</span></button></div>
+      <span class="dock-divider"></span><button class="call-control transcript-toggle" id="txToggleFt" aria-expanded="false" aria-controls="txPanelFt">${icon('text')}<span>Transkript</span></button>
+    </div><p class="permission-note" id="permissionNote">${p?'Mikrofon und Kamera werden erst beim Anruf aktiviert.':'Lege in den Einstellungen deinen ersten KI-Kontakt an.'}</p></div>
+    <section class="transcript-panel hidden" id="txPanelFt" aria-label="Gesprächstranskript"><div class="transcript-head"><div><h2>Transkript</h2><p>Dein Gespräch mit ${esc(p?.name||'deiner KI')}</p></div><button class="icon-btn" id="txClose" aria-label="Transkript schließen">${icon('close')}</button></div><div class="chat-log" id="chatLog" role="log" aria-live="polite"></div><form class="composer" id="ftComposer"><label class="sr-only" for="ftMsg">Nachricht im Anruf</label><input type="text" id="ftMsg" placeholder="Im Anruf schreiben …" autocomplete="off"><button class="send-button" id="ftSend" aria-label="Nachricht senden">${icon('send')}</button></form><p class="composer-note">Textnachrichten sind während eines Anrufs möglich.</p></section>
+  </section>`;
+  $('ftAudio').onclick=()=>startCall(false);$('ftVideo').onclick=()=>startCall(true);
+  $('ftMute').onclick=()=>CallSession.setMuted(!CallSession.isMuted());$('ftCamera').onclick=()=>setFtVideo(!ftVideoActive);
+  $('ftHangup').onclick=async()=>{ if(endingCall)return;endingCall=true;syncCallUI();try{await CallSession.endCall();}catch(e){reportError(e);}finally{endingCall=false;syncCallUI();} };
+  $('ftComposer').onsubmit=e=>{e.preventDefault();const t=$('ftMsg').value.trim();if(t&&CallSession.state.callActive){$('ftMsg').value='';CallSession.pushText(t,true).catch(reportError);}};
+  $('txToggleFt').onclick=()=>toggleTranscript();$('txClose').onclick=()=>toggleTranscript(false);
+  $('ftStage').onclick=()=>{if(CallSession.state.speaking)CallSession.flushQueue();};
+  syncCallUI(); loadTranscript();
+}
+function toggleTranscript(force){const open=force??$('txPanelFt').classList.contains('hidden');$('txPanelFt').classList.toggle('hidden',!open);$('txToggleFt').setAttribute('aria-expanded',String(open));if(open)$('txClose').focus();else $('txToggleFt').focus();}
+function syncCallUI(){
+  const state=CallSession.state, active=state.callActive;
+  document.body.classList.toggle('video-on',state.videoOn);
+  $('persona').disabled=active||callBusy||endingCall||personaBusy;
+  if($('personaSettings'))$('personaSettings').disabled=active||callBusy||endingCall||personaBusy||!personaId;
+  $('liveDot').classList.toggle('hidden',!active);$('activeCallNote').classList.toggle('hidden',!active);
+  $('contactNote').textContent=active?'Im Gespräch · Persona gesperrt':'Dein persönlicher KI-Kontakt';
+  if(!$('ftAudio'))return;
+  $('dialActions').classList.toggle('hidden',active);$('activeActions').classList.toggle('hidden',!active);
+  $('ftAudio').disabled=$('ftVideo').disabled=callBusy||endingCall||personaBusy||!personaId;
+  $('ftHangup').disabled=endingCall; $('ftMute').disabled=endingCall;
+  $('ftMute').innerHTML=icon(state.muted?'micOff':'mic')+'<span>'+(state.muted?'Stumm':'Mikrofon')+'</span>';
+  $('ftMute').setAttribute('aria-pressed',String(state.muted));$('ftMute').setAttribute('aria-label',state.muted?'Mikrofon einschalten':'Mikrofon stummschalten');$('ftMute').classList.toggle('selected',state.muted);
+  $('ftCamera').innerHTML=icon(state.videoOn?'video':'cameraOff')+'<span>'+(videoBusy?'Kamera …':state.videoOn?'Kamera an':'Kamera aus')+'</span>';
+  $('ftCamera').setAttribute('aria-pressed',String(state.videoOn));$('ftCamera').disabled=videoBusy||endingCall;
+  $('ftStatus').textContent=callStatus;$('ftTimer').classList.toggle('hidden',!active);updateTimer();
+  $('callHint').textContent=active?(state.muted?'Dein Mikrofon ist stummgeschaltet.':state.videoOn?'Du bist im Videoanruf.':'Du bist im Audioanruf.'):'Einfach anrufen. Und ganz du selbst sein.';
+  $('permissionNote').textContent=active?'Dein Gegenüber ist eine KI.':personaId?'Mikrofon und Kamera werden erst beim Anruf aktiviert.':'Erstelle in den Einstellungen deinen ersten Kontakt.';
+  $('ftMsg').disabled=$('ftSend').disabled=!active;
+}
+function updateTimer(){if($('ftTimer')&&callStartedAt){const seconds=Math.max(0,Math.floor((Date.now()-callStartedAt)/1000));$('ftTimer').textContent=String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');}}
+setInterval(updateTimer,1000);
+async function startCall(video){
+  if(callBusy||endingCall||personaBusy||CallSession.state.callActive||!personaId)return;
+  callBusy=true;callStatus='Verbindung wird hergestellt …';syncCallUI();
+  try{const ok=await CallSession.startCall(video);if(ok&&video&&CallSession.state.callActive)await setFtVideo(true);else if(!ok&&callStatus==='Verbindung wird hergestellt …')callStatus='Anruf konnte nicht gestartet werden.';}catch(e){callStatus='Verbindung fehlgeschlagen: '+e.message;reportError(e);}finally{callBusy=false;syncCallUI();}
+}
+async function ensureFtEngine(){
+  if(!ftEngineInit)ftEngineInit=import('/static/js/facetime-engine.js?v=10').catch(e=>{ftEngineInit=null;throw e;});
+  const module=await ftEngineInit;
+  if(!ftVideoActive)return;
+  if(!ftEngine){ftEngine=new module.FacetimeEngine();ftEngine.modelName=currentPersona()?.vrm_model||'emma';}
+  ftEngine.attach($('vrmCanvas'),$('fbPortrait'),$('engineBadge'));
+}
+function resizeFtCanvas(){ ftEngine?.resize(); }
+new ResizeObserver(resizeFtCanvas).observe($('callView'));
+async function setFtVideo(on){
+  if(on&&!CallSession.state.callActive)return;
+  const generation=++videoGen;
+  if(!on){ftVideoActive=false;videoBusy=false;CallSession.disableVideo();if(ftEngine){ftEngine.shutdown();ftEngine=null;window._ftEngine=null;}$('vrmCanvas')?.classList.add('veiled');if($('fbPortrait'))$('fbPortrait').style.display='flex';if($('engineBadge'))$('engineBadge').textContent='KI-Kontakt · Audio';syncCallUI();return;}
+  videoBusy=true;syncCallUI();
+  try{const ok=await CallSession.enableVideo();if(generation!==videoGen)return;ftVideoActive=ok;if(ok){$('engineBadge').textContent='Avatar wird geladen …';await ensureFtEngine();revealFtAvatar();}}catch(e){if(generation===videoGen)$('engineBadge').textContent='Portrait · Avatar nicht verfügbar';reportError(e);}finally{if(generation===videoGen){videoBusy=false;syncCallUI();}}
+}
 function revealFtAvatar(){
-  if(revealFtAvatar._watch) return;
-  revealFtAvatar._watch = setInterval(()=>{
-    if(!ftVideoActive){ clearInterval(revealFtAvatar._watch); revealFtAvatar._watch=null; return; }
-    if(!(window._ftEngine && window._ftEngine.vrm)) return;
-    clearInterval(revealFtAvatar._watch);
-    revealFtAvatar._watch = null;
-    const cv=$('vrmCanvas');
-    if(cv) cv.classList.remove('veiled');
-  }, 250);
+  clearInterval(revealFtAvatar.timer);
+  revealFtAvatar.timer=setInterval(()=>{if(!ftVideoActive||!ftEngine||(!ftEngine._initPending&&!ftEngine.running)){clearInterval(revealFtAvatar.timer);return;}if(ftEngine.vrm&&ftEngine.running){$('vrmCanvas')?.classList.remove('veiled');clearInterval(revealFtAvatar.timer);}},200);
 }
-
-
-function bindCallEngine(){
-  CallSession.setPersona(personaId);
-  CallSession.callback = ev => {
-    const st = $('ftStatus');
-    switch(ev.type){
-      case 'mute': { const b=$('ftMute'); if(b) b.classList.toggle('muted', ev.on); setStatus(st, ev.on?'🔇 stumm':'Mikro an'); break; }
-      case 'call-start': enterFtCall(ev.at); break;
-      case 'call-end': exitFtCall(); setFtVideo(false); setStatus(st,'Bereit'); break;
-      case 'listening': setStatus(st,'🎧 hört zu…'); break;
-      case 'transcribing': setStatus(st,'✍ transkribiere…'); break;
-      case 'user': appendTranscript('user', ev.text); setStatus(st,'denkt nach…'); break;
-      case 'assistant': {
-        appendTranscript('assistant', ev.text);
-        setStatus(st,'spricht…');
-        if(ev.timings) window.DebugConsole && DebugConsole.log(
-          `⏱ LLM ${(ev.timings.llm ?? '?')}s · erstes Audio nach ${(ev.timings.tts_first ?? '?')}s`);
-        break;
-      }
-      case 'playback-end': setStatus(st,'🎧 hört zu…'); break;
-      case 'interjected': case 'flushed': setStatus(st,'⏸ unterbrochen'); break;
-      case 'error': setStatus(st,'Fehler: '+ev.error); break;
-    }
-  };
-
-  function setStatus(el, txt){ if(el) el.textContent = txt; }
-  function appendTranscript(role, text){
-    const log = $('chatLog'); if(!log) return;
-    if(log.querySelector('.empty-hint')) log.innerHTML='';
-    log.insertAdjacentHTML('beforeend', `<div class="msg ${role}">${text}</div>`);
-    log.scrollTop = log.scrollHeight;
+function transcriptMessages(){return historyCache.get(personaId)||[];}
+function renderTranscript(){const log=$('chatLog');if(!log)return;const messages=transcriptMessages();log.innerHTML=messages.length?messages.map(m=>`<div class="msg ${m.role==='user'?'user':'assistant'}"><span class="msg-author">${m.role==='user'?'Du':esc(currentPersona()?.name||'KI')}</span>${esc(m.content)}</div>`).join(''):'<div class="transcript-empty">'+icon('text')+'<h3>Raum für dein Gespräch</h3><p>Gesprochene und geschriebene Nachrichten erscheinen hier.</p></div>';log.scrollTop=log.scrollHeight;}
+async function loadTranscript(){const id=personaId;renderTranscript();if(!id||historyCache.has(id))return;const messages=[];historyCache.set(id,messages);try{const saved=await api('/api/history/'+encodeURIComponent(id));historyCache.set(id,[...saved,...messages]);if(id===personaId)renderTranscript();}catch(e){if(id===personaId)toast('Bisheriges Transkript konnte nicht geladen werden.',true);}}
+CallSession.callback=ev=>{
+  switch(ev.type){
+    case 'call-start':callStartedAt=ev.at;callStatus='Verbindung wird hergestellt …';break;
+    case 'call-end':callStartedAt=null;callStatus='Anruf beendet';setFtVideo(false);break;
+    case 'listening':case 'playback-end':callStatus='Hört dir zu';break;
+    case 'transcribing':callStatus='Versteht dich …';break;
+    case 'user':case 'assistant':{const messages=transcriptMessages();messages.push({role:ev.type,content:ev.text});historyCache.set(personaId,messages);renderTranscript();callStatus=ev.type==='user'?'Denkt nach …':'Spricht mit dir';break;}
+    case 'interjected':case 'flushed':callStatus='Unterbrochen · hört dir zu';break;
+    case 'error':callStatus='Fehler: '+ev.error;toast(ev.error,true);break;
   }
-
-  // restore persistent history into transcript
-  api('/api/history/'+personaId).then(msgs=>{
-    const log=$('chatLog');
-    if(!msgs.length || !log) return;
-    log.innerHTML='';
-    msgs.forEach(m=>log.insertAdjacentHTML('beforeend', `<div class="msg ${m.role}">${m.content}</div>`));
-    log.scrollTop=log.scrollHeight;
-  }).catch(()=>{});
-
-  // call bar: Audio anrufen / Video-Call / Mute / Auflegen
-  $('ftAudio').onclick = async () => {
-    if(!CallSession.state.callActive){
-      setStatus($('ftStatus'), 'Verbinde…');
-      await CallSession.startCall();
-    } else setFtVideo(false);            // idempotent
-  };
-  $('ftVideo').onclick = async () => {
-    if(!CallSession.state.callActive){
-      setStatus($('ftStatus'), 'Verbinde…');
-      const ok = await CallSession.startCall();
-      if(ok) setFtVideo(true);
-    } else setFtVideo(true);              // idempotent
-  };
-  $('ftMute').onclick = () => CallSession.setMuted(!CallSession.isMuted());
-  $('ftHangup').onclick = async () => { stopFtCallTimer(); await CallSession.endCall(); };
-  const input = $('ftMsg');
-  if(input) input.addEventListener('keydown', e=>{
-    if(e.key==='Enter' && input.value.trim()){ const t=input.value.trim(); input.value=''; CallSession.pushText(t, true); }
-  });
-  // interject: Klick auf die Bühne unterbricht Emma (Playback geflusht)
-  const stage = $('ftStage');
-  if(stage) stage.addEventListener('click', ()=>{
-    if(CallSession.state.speaking) CallSession.flushQueue();
-  });
-  // transcript toggle
-  const txB=$('txToggleFt'), txP=$('txPanelFt');
-  if(txB && txP) txB.onclick = () => txP.classList.toggle('hidden');
+  syncCallUI();
+};
+function pageHeading(eyebrow,title,description){return `<div class="page-title"><span class="section-label">${eyebrow}</span><h1>${title}</h1><p>${description}</p></div>`;}
+let modelPicker=null;
+function stopModelPicker(){
+ const picker=modelPicker;if(!picker)return;
+ pauseModelPicker(picker);
+ modelPicker=null;
 }
-
-
-/* ================= Personas view ================= */
-function renderPersonas(){
-  const p=currentPersona()||{};
-  $('view').innerHTML = `
-    <div class="grid-2">
-      <div class="card">
-        <div class="persona-card-row" style="margin-bottom:16px">
-          <img src="/api/personas/portrait" onerror="this.style.visibility='hidden'">
-          <div><b style="font-size:17px">${p.name||'—'}</b><br>
-            <span style="font-size:13px;color:var(--text-dim)">
-              Bild ${p.ref_image?'✓':'—'} · Stimme ${p.voice_sample?'✓':'—'} · Profil ${p.voice_profile||'—'} · VRM ${p.vrm_model||'—'} · Silent ${Number(p.silent_summary) !== 0 ? '✓ ' + Math.round((p.silent_ratio ?? 0.8) * 100) + '% verworfen' : '—'}
-            </span></div>
-        </div>
-        <div class="field"><label>Persönlichkeit (System-Prompt)</label>
-          <textarea id="pPrompt">${p.personality_prompt||''}</textarea></div>
-        <div class="grid-2">
-          <div class="field"><label>Sprache</label>
-            <select id="pLang">${['German','English'].map(l=>`<option ${p.language===l?'selected':''}>${l}</option>`).join('')}</select></div>
-          <div class="field"><label>OmniVoice-Profil</label>
-            <input type="text" id="pVoiceProfile" value="${p.voice_profile||'emma_alicia'}"></div>
-        </div>
-        <div class="grid-2">
-          <div class="field"><label>Silent Summary (Kamera)</label>
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px" title="Emma darf auf reine Kamera-Zustandsbeschreibungen (User sagt nichts) selbst entscheiden, ob sie reagiert.">
-              <input type="checkbox" id="pSilent" ${Number(p.silent_summary) !== 0 ? 'checked' : ''} style="width:auto"> Aktiv</label></div>
-          <div class="field"><label>verworfene Silent-Turns (%)</label>
-            <input type="number" id="pRatio" min="0" max="100" step="5" title="Mindestanteil der stillen Momente, in denen Emma NICHT antwortet (80 = 4 von 5)." value="${Math.round((p.silent_ratio ?? 0.8) * 100)}"></div>
-        </div>
-        <button class="btn" onclick="savePersona()">Speichern</button>
-      </div>
-      <div>
-        <div class="card"><h3>Referenz-Bild (fotoreale Ebene)</h3>
-          <div class="upload-tile" onclick="$('imgFile').click()">📷 Bild hochladen — Referenz-Bild &amp; Portrait</div>
-          <input type="file" id="imgFile" accept="image/*" style="display:none" onchange="uploadAsset('image',this)"></div>
-        <div class="card" style="margin-top:14px"><h3>Stimmprobe (H3-native Ebene)</h3>
-          <div class="upload-tile" onclick="$('voiceFile').click()">🎤 Audio hochladen — Voice-Referenz für H3</div>
-          <input type="file" id="voiceFile" accept="audio/*" style="display:none" onchange="uploadAsset('voice',this)"></div>
-        <div class="card" style="margin-top:14px"><h3>Neue Persona</h3>
-          <div class="field"><input type="text" id="npName" placeholder="Name"></div>
-          <button class="btn secondary" onclick="createPersona()">Anlegen</button></div>
-      </div>
-    </div>`;
+function pauseModelPicker(picker){
+ clearInterval(picker.poll);picker.poll=null;invalidateModelRequest(picker);
 }
-
+function resumeModelPicker(picker){
+ if(!modelPickerCurrent(picker)||document.hidden)return;
+ clearInterval(picker.poll);
+ picker.poll=setInterval(()=>{if(!picker.debounce&&!picker.controller)refreshModels(picker);},30000);
+ refreshModels(picker);
+}
+function modelPickerCurrent(picker){return modelPicker===picker&&currentView==='personas'&&personaId===picker.personaId&&picker.select.isConnected;}
+function modelPickerKey(picker){return picker.provider.value+'\n'+(picker.provider.value==='configured'?picker.base.value.trim():'');}
+function renderModelChoices(picker,selected=picker.select.value){
+ const configured=picker.provider.value==='configured', data=picker.data;
+ const options=[new Option(configured?(data?.default_model?'Server-Standard ('+data.default_model+')':'Server-Standard übernehmen'):'Bitte ein Cloud-Modell auswählen','')];
+ const ids=new Set();
+ for(const model of data?.models||[]){
+  if(typeof model.id!=='string'||!model.id||ids.has(model.id))continue;
+  ids.add(model.id);options.push(new Option(typeof model.name==='string'&&model.name?model.name:model.id,model.id));
+ }
+ const unavailable=!!selected&&!!data&&!ids.has(selected);
+ if(selected&&!ids.has(selected))options.push(new Option(selected+(data?' (nicht verfügbar; Auswahl beibehalten)':' (Auswahl; noch nicht geprüft)'),selected));
+ picker.select.replaceChildren(...options);picker.select.value=selected;picker.select.required=!configured;
+ picker.selection.textContent=unavailable?'Das ausgewählte Modell ist aktuell nicht in der Modellliste verfügbar. Die Auswahl bleibt gespeichert.':!configured&&!selected?'Für OpenCode Go musst du ein Modell ausdrücklich auswählen.':configured&&!selected?'Diese Persona übernimmt das konfigurierte Server-Modell.':'';
+}
+function configureModelProvider(picker,selected){
+ const configured=picker.provider.value==='configured';
+ picker.base.readOnly=!configured;picker.base.value=configured?picker.configuredBase:'';
+ picker.base.placeholder=configured?'Leer lassen: konfigurierten Server-Endpunkt verwenden':'Wird serverseitig ermittelt';
+ picker.baseHelp.textContent=configured?'Optionaler OpenAI-kompatibler Endpunkt für diese Persona. Leer lassen, um die Server-Konfiguration zu nutzen. Der konfigurierte API-Schlüssel wird nur bei gleichem Protokoll, Host und Port verwendet; andere Endpunkte werden ohne diesen Schlüssel angesprochen.':'Der OpenCode-Go-Endpunkt wird ausschließlich vom Server festgelegt und kann hier nicht geändert werden.';
+ picker.note.textContent=configured?'Zugangsdaten bleiben in der Server-Konfiguration; hier werden keine Schlüssel eingegeben.':'OpenCode Go ist ein Cloud-Dienst für Coding-Agenten: Dein Gespräch wird an den Anbieter übertragen. Der Schlüssel bleibt serverseitig (Server-Umgebung oder Hermes-Konfiguration).';
+ picker.data=null;renderModelChoices(picker,selected);
+}
+function invalidateModelRequest(picker){
+ clearTimeout(picker.debounce);picker.debounce=null;picker.controller?.abort();picker.controller=null;picker.request++;
+ picker.select.removeAttribute('aria-busy');
+}
+async function refreshModels(picker){
+ if(!modelPickerCurrent(picker)||document.hidden)return;
+ invalidateModelRequest(picker);
+ const request=picker.request, key=modelPickerKey(picker), provider=picker.provider.value;
+ const controller=new AbortController();picker.controller=controller;
+ picker.status.textContent='Modellliste wird geladen …';picker.select.setAttribute('aria-busy','true');
+ try{
+  const query=new URLSearchParams({provider});if(provider==='configured'&&picker.base.value.trim())query.set('base_url',picker.base.value.trim());
+  const data=await api('/api/models?'+query,{signal:controller.signal});
+  if(!modelPickerCurrent(picker)||request!==picker.request||key!==modelPickerKey(picker))return;
+  picker.data=data;if(provider==='opencode-go')picker.base.value=typeof data.base_url==='string'?data.base_url:'';
+  renderModelChoices(picker);
+  picker.status.textContent=data.models?.length?'Modellliste aktualisiert. Automatische Aktualisierung alle 30 Sekunden.':'Der Anbieter meldet keine verfügbaren Modelle. Eine bestehende Auswahl bleibt erhalten.';
+ }catch(e){
+  if(e.name==='AbortError'||!modelPickerCurrent(picker)||request!==picker.request||key!==modelPickerKey(picker))return;
+  picker.status.textContent='Modellliste konnte nicht geladen werden: '+(e.message||'Unbekannter Fehler')+'. Deine Auswahl bleibt erhalten; andere Einstellungen können weiter bearbeitet werden.';
+ }finally{
+  if(modelPickerCurrent(picker)&&request===picker.request){picker.select.removeAttribute('aria-busy');picker.controller=null;}
+ }
+}
+function startModelPicker(p,draft=null){
+ const picker={personaId:personaId,provider:$('pProvider'),base:$('pBaseUrl'),select:$('pModel'),status:$('pModelStatus'),selection:$('pModelSelection'),baseHelp:$('pBaseHelp'),note:$('pProviderNote'),configuredBase:draft?.configuredBase??p.llm_base_url??'',drafts:new Map(draft?.drafts),data:null,request:0,controller:null,poll:null,debounce:null};
+ modelPicker=picker;picker.provider.value=(draft?.provider??p.llm_provider)==='opencode-go'?'opencode-go':'configured';
+ configureModelProvider(picker,draft?.model??p.llm_model??'');picker.drafts.set(modelPickerKey(picker),picker.select.value);picker.key=modelPickerKey(picker);
+ picker.select.onchange=()=>{picker.drafts.set(modelPickerKey(picker),picker.select.value);renderModelChoices(picker);};
+ picker.provider.onchange=()=>{
+  picker.drafts.set(picker.key,picker.select.value);invalidateModelRequest(picker);
+  configureModelProvider(picker,picker.drafts.get(picker.provider.value+'\n'+(picker.provider.value==='configured'?picker.configuredBase.trim():''))||'');
+  picker.key=modelPickerKey(picker);refreshModels(picker);
+ };
+ picker.base.oninput=()=>{
+  if(picker.provider.value!=='configured')return;
+  picker.drafts.set(picker.key,picker.select.value);picker.configuredBase=picker.base.value;invalidateModelRequest(picker);
+  picker.key=modelPickerKey(picker);picker.data=null;renderModelChoices(picker,picker.drafts.get(picker.key)??picker.select.value);
+  picker.status.textContent='Modellliste wird nach der Eingabe aktualisiert …';
+  picker.debounce=setTimeout(()=>refreshModels(picker),400);
+ };
+ $('refreshModels').onclick=()=>refreshModels(picker);
+ resumeModelPicker(picker);
+}
+function renderPersonas(preserveModelDraft=false){
+ const picker=modelPicker, draft=preserveModelDraft&&picker&&modelPickerCurrent(picker)?{provider:picker.provider.value,configuredBase:picker.configuredBase,model:picker.select.value,drafts:picker.drafts}:null;
+ stopModelPicker();
+ const p=currentPersona()||{}, locked=CallSession.state.callActive||callBusy||endingCall;
+ $('view').innerHTML=pageHeading('DEIN STUDIO','Ganz nach deinem Gefühl.','Gestalte, mit wem du sprichst. Persönlichkeit, Aussehen und Stimme – an einem Ort.')+`
+ <div class="settings-profile">${portrait(p)}<div><h2>${esc(p.name||'Dein erster Kontakt')}</h2><p>${p.id?'Deine persönliche KI-Persona':'Erstelle eine Persona, um anzurufen.'}</p></div><button class="btn secondary" onclick="go('facetime')">${icon('phone')}<span>Zum Gespräch</span></button></div>
+ ${locked?'<p class="info-note">Der Anruf läuft weiter. Du kannst Einstellungen ansehen; Änderungen sind nach dem Anruf möglich.</p>':''}
+ <div class="settings-grid"><form id="personaForm" class="settings-main"><fieldset id="personaSettings" ${locked||!p.id?'disabled':''}>
+ <section class="card"><div class="section-heading"><span class="section-symbol">${icon('text')}</span><div><h2>Persönlichkeit</h2><p>Was deinen Kontakt ausmacht.</p></div></div><div class="field"><label for="pName">Name</label><input id="pName" type="text" value="${esc(p.name)}" required maxlength="100"></div><div class="field"><label for="pPrompt">So soll sich deine KI verhalten</label><textarea id="pPrompt" rows="5" placeholder="Warmherzig, neugierig und mit einem Sinn für Humor …">${esc(p.personality_prompt)}</textarea><p class="field-help">Beschreibe Charakter, Interessen und Gesprächsstil.</p></div></section>
+ <section class="card"><div class="section-heading"><span class="section-symbol">${icon('settings')}</span><div><h2>KI-Modell &amp; Anbieter</h2><p>Wähle, wo dein Kontakt denkt.</p></div></div><div class="field"><label for="pProvider">Anbieter</label><select id="pProvider" aria-describedby="pProviderNote"><option value="configured">Konfigurierter / lokaler Endpunkt</option><option value="opencode-go">OpenCode Go · Cloud</option></select><p class="field-help" id="pProviderNote"></p></div><div class="field"><label for="pBaseUrl">Endpunkt-Basis-URL</label><input id="pBaseUrl" type="url" aria-describedby="pBaseHelp" autocomplete="off" spellcheck="false"><p class="field-help" id="pBaseHelp"></p></div><div class="field"><label for="pModel">Modell</label><select id="pModel" aria-describedby="pModelStatus pModelSelection"></select><p class="field-help" id="pModelStatus" role="status" aria-live="polite" aria-atomic="true"></p><p class="field-help" id="pModelSelection" role="status" aria-live="polite" aria-atomic="true"></p><button type="button" class="btn secondary small" id="refreshModels">Modellliste aktualisieren</button></div></section>
+ <section class="card"><div class="section-heading"><span class="section-symbol">${icon('video')}</span><div><h2>Erscheinungsbild</h2><p>Ein vertrautes Gesicht für deine Gespräche.</p></div></div><div class="appearance-row">${portrait(p)}<div><h3>Kontaktportrait</h3><p>${p.ref_image?'Dein eigenes Bild ist hinterlegt.':'Ein Foto macht deinen Kontakt persönlich.'}</p><button type="button" class="btn secondary small" onclick="$('imgFile').click()">${icon('upload')}<span>Bild auswählen</span></button><input type="file" id="imgFile" accept="image/*" hidden onchange="uploadAsset('image',this)"></div></div><div class="field"><label for="pVrm">Avatar im Videoanruf</label><select id="pVrm"><option value="emma" ${!p.vrm_model||p.vrm_model==='emma'?'selected':''}>Emma</option><option value="default" ${p.vrm_model==='default'?'selected':''}>Studio · Standard</option>${p.vrm_model&&!['emma','default'].includes(p.vrm_model)?`<option value="${esc(p.vrm_model)}" selected>${esc(p.vrm_model)} · bisherige Auswahl</option>`:''}</select><p class="field-help">Der animierte 3D-Avatar spricht im Videoanruf. Im Audioanruf siehst du das Portrait.</p></div></section>
+ <section class="card"><div class="section-heading"><span class="section-symbol">${icon('wave')}</span><div><h2>Stimme &amp; Sprache</h2><p>So klingt eure Unterhaltung.</p></div></div><div class="grid-2"><div class="field"><label for="pLang">Sprache</label><select id="pLang"><option value="German" ${p.language!=='English'?'selected':''}>Deutsch</option><option value="English" ${p.language==='English'?'selected':''}>Englisch</option></select></div><div class="field"><label for="pVoiceProfile">Stimmprofil · OmniVoice</label><input type="text" id="pVoiceProfile" value="${esc(p.voice_profile||'emma_alicia')}"></div></div><div class="voice-upload"><div><h3>Eigene Stimmprobe</h3><p>${p.voice_sample?'Eine Audio-Referenz ist hinterlegt.':'Optionale Audio-Referenz für H3.'}</p></div><button type="button" class="btn secondary small" onclick="$('voiceFile').click()">${icon('upload')}<span>Audio auswählen</span></button><input type="file" id="voiceFile" accept="audio/*" hidden onchange="uploadAsset('voice',this)"></div></section>
+ <details class="card advanced"><summary>Erweiterte Kamera-Einstellungen</summary><p class="field-help">Steuere, wie deine KI in stillen Momenten auf Kamerabilder reagiert.</p><div class="field"><label class="check-label" for="pSilent"><input type="checkbox" id="pSilent" ${Number(p.silent_summary)!==0?'checked':''}> Reaktionen auf stille Kameramomente erlauben</label></div><div class="field"><label for="pRatio">Stille Momente ohne Antwort (%)</label><input type="number" id="pRatio" min="0" max="100" step="5" value="${Math.round((p.silent_ratio??0.8)*100)}"><p class="field-help">80 % bedeutet: In vier von fünf stillen Momenten antwortet die KI nicht.</p></div></details>
+ <div class="save-row"><span>Gilt für ${esc(p.name||'deinen Kontakt')}</span><button class="btn" id="savePersonaButton" type="submit">Änderungen speichern</button></div></fieldset></form>
+ <aside class="settings-aside"><section class="card"><span class="section-symbol">${icon('plus')}</span><h2>Ein neuer Kontakt</h2><p>Eine andere Persönlichkeit. Eine neue Perspektive.</p><form id="newPersonaForm"><div class="field"><label for="npName">Name der Persona</label><input type="text" id="npName" placeholder="Wie heißt dein Kontakt?" required maxlength="100" ${locked?'disabled':''}></div><button class="btn secondary" id="createPersonaButton" ${locked?'disabled':''}>${icon('plus')}<span>Persona erstellen</span></button></form></section><details class="card diagnostics"><summary>Studio-Diagnose</summary><p class="field-help">Dienste und technische Meldungen.</p><div class="svc-row"><span class="svc-dot" id="svc-omni"></span><span>OmniVoice</span><span class="svc-status" id="svc-omni-label">Wird geprüft</span></div><div class="svc-row"><span class="svc-dot" id="svc-comfy"></span><span>ComfyUI</span><span class="svc-status" id="svc-comfy-label">Wird geprüft</span></div><button class="text-button" type="button" onclick="PipeLog.toggle(true)">Pipeline öffnen ${icon('arrow')}</button><button class="text-button" type="button" onclick="DebugConsole.toggle(true)">Debug-Konsole ${icon('arrow')}</button></details></aside></div>`;
+ $('personaForm').onsubmit=e=>{e.preventDefault();savePersona();};$('newPersonaForm').onsubmit=e=>{e.preventDefault();createPersona();};
+ startModelPicker(p,draft);
+ for(const [service,id] of [['omnivoice','omni'],['comfy','comfy']]){fetch('/api/health/'+service).then(r=>r.json()).then(d=>setServiceStatus(id,!!d.ok)).catch(()=>setServiceStatus(id,false));}
+}
+function setServiceStatus(id,ok){const dot=$('svc-'+id),label=$('svc-'+id+'-label');if(dot)dot.className='svc-dot '+(ok?'ok':'bad');if(label)label.textContent=ok?'Bereit':'Nicht erreichbar';}
 async function savePersona(){
-  await api('/api/personas/'+personaId, {method:'PATCH', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({personality_prompt:$('pPrompt').value, language:$('pLang').value, voice_profile:$('pVoiceProfile').value, silent_summary:$('pSilent').checked, silent_ratio:Math.min(100, Math.max(0, Number($('pRatio').value))) / 100})});
-  toast('Gespeichert'); loadPersonas();
+ if(CallSession.state.callActive||callBusy||endingCall||personaBusy)return;
+ const button=$('savePersonaButton');button.disabled=true;personaBusy=true;syncCallUI();
+ try{
+  await api('/api/personas/'+encodeURIComponent(personaId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('pName').value.trim(),personality_prompt:$('pPrompt').value,language:$('pLang').value,voice_profile:$('pVoiceProfile').value,vrm_model:$('pVrm').value,silent_summary:$('pSilent').checked,silent_ratio:Math.min(100,Math.max(0,Number($('pRatio').value)))/100,llm_provider:$('pProvider').value,llm_base_url:$('pProvider').value==='configured'?$('pBaseUrl').value.trim():'',llm_model:$('pModel').value})});
+  await loadPersonas(personaId);renderFacetime();if(currentView==='personas')renderPersonas();toast('Deine Änderungen sind gespeichert.');
+ }catch(e){reportError(e);}finally{personaBusy=false;button.disabled=false;syncCallUI();}
 }
-async function uploadAsset(kind, inp){
-  if(!inp.files[0]) return;
-  const fd=new FormData(); fd.append('file', inp.files[0]);
-  await api(`/api/personas/${personaId}/${kind}`, {method:'POST', body:fd});
-  toast(kind==='image'?'Bild hochgeladen':'Stimme hochgeladen'); loadPersonas();
+async function uploadAsset(kind,input){
+ if(!input.files[0]||CallSession.state.callActive||callBusy||endingCall||personaBusy)return;
+ const id=personaId,fd=new FormData();fd.append('file',input.files[0]);input.disabled=true;personaBusy=true;syncCallUI();
+ try{
+  await api('/api/personas/'+encodeURIComponent(id)+'/'+kind,{method:'POST',body:fd});portraitVersion=Date.now();await loadPersonas(id);renderFacetime();if(currentView==='personas')renderPersonas(true);toast(kind==='image'?'Dein Portrait wurde aktualisiert.':'Deine Stimmprobe wurde hochgeladen.');
+ }catch(e){reportError(e);}finally{personaBusy=false;input.disabled=false;syncCallUI();}
 }
 async function createPersona(){
-  const n=$('npName').value.trim(); if(!n) return;
-  const p=await api('/api/personas',{method:'POST', body:new URLSearchParams({name:n})});
-  $('npName').value=''; await loadPersonas(); personaId=p.id; onPersonaSwitch(); go('personas');
+ if(CallSession.state.callActive||callBusy||endingCall||personaBusy)return;
+ const name=$('npName').value.trim();if(!name)return;const button=$('createPersonaButton');button.disabled=true;personaBusy=true;syncCallUI();
+ try{
+  const p=await api('/api/personas',{method:'POST',body:new URLSearchParams({name})});await loadPersonas(p.id);callStatus='Bereit für ein Gespräch';renderFacetime();go('personas');toast('Dein neuer Kontakt ist bereit.');
+ }catch(e){reportError(e);}finally{personaBusy=false;button.disabled=false;syncCallUI();}
 }
-
-/* ================= Facts view ================= */
 function renderFacts(){
-  $('view').innerHTML = `
-    <div class="grid-31">
-      <div class="card">
-        <h3>Faktenkarten — ${currentPersona()?.name||''}</h3>
-        <div class="row" style="margin-bottom:12px">
-          <input type="text" id="factNew" placeholder="Neuer Fakt… (Enter)">
-          <button class="btn" onclick="addFact()">+</button>
-        </div>
-        <ul class="fact-list" id="factList"></ul>
-      </div>
-      <div class="card">
-        <h3>Suchen</h3>
-        <input type="text" id="factQ" placeholder="Semantische Suche…">
-        <div id="factResults" style="margin-top:10px;font-size:13.5px;color:var(--text-dim)"></div>
-      </div>
-    </div>`;
-  $('factNew').addEventListener('keydown',e=>{ if(e.key==='Enter') addFact(); });
-  $('factQ').addEventListener('input', e=>searchFacts(e.target.value));
-  loadFacts();
+ $('view').innerHTML=pageHeading('GEMEINSAMES WISSEN','Die kleinen Dinge zählen.','Was deine KI über dich wissen soll – damit jedes Gespräch ein Stück persönlicher wird.')+`<div class="knowledge-grid"><section class="card"><div class="section-heading"><span class="section-symbol">${icon('book')}</span><div><h2>Erinnerungen</h2><p>Für ${esc(currentPersona()?.name||'deinen Kontakt')} und dein Studio.</p></div></div><form class="fact-composer" id="factForm"><label class="sr-only" for="factNew">Neue Erinnerung</label><input type="text" id="factNew" placeholder="Was soll in Erinnerung bleiben?" required><button class="btn" ${!personaId?'disabled':''}>${icon('plus')}<span>Merken</span></button></form><ul class="fact-list" id="factList"><li class="empty-hint">Erinnerungen werden geladen …</li></ul></section><section class="card search-card"><h2>Etwas wiederfinden</h2><p>Suche nach einer Erinnerung – auch mit deinen eigenen Worten.</p><div class="field"><label for="factQ">Wissen durchsuchen</label><input type="search" id="factQ" placeholder="Zum Beispiel: Lieblingsessen"></div><div id="factResults" aria-live="polite"></div></section></div>`;
+ $('factForm').onsubmit=e=>{e.preventDefault();addFact();};$('factQ').oninput=e=>{clearTimeout(searchFacts.timer);searchFacts.timer=setTimeout(()=>searchFacts(e.target.value),250);};loadFacts();
 }
 async function loadFacts(){
-  const facts=await api('/api/facts').catch(()=>[]);
-  $('factList').innerHTML = facts.length ? facts.map(f=>`
-    <li><div style="flex:1">${f.fact}<br><span class="fact-scope">${f.persona_id?'persona-scoped':'global'}</span></div>
-        <button class="del" onclick="delFact('${f.id}')">×</button></li>`).join('')
-    : '<li class="empty-hint" style="display:block">Noch keine Fakten. „Basti hat eine Katze" o.ä. — der Avatar merkt sichs.</li>';
+ const list=$('factList');if(!list)return;
+ try{const facts=await api('/api/facts');if(!list.isConnected)return;const visible=facts.filter(f=>!f.persona_id||f.persona_id===personaId);list.innerHTML=visible.length?visible.map(f=>`<li><div><p>${esc(f.fact)}</p><span class="fact-scope">${f.persona_id?esc(currentPersona()?.name||'Persona'):'Alle Kontakte'}</span></div><button class="icon-btn del" data-fact-id="${esc(f.id)}" aria-label="Erinnerung löschen">${icon('trash')}</button></li>`).join(''):'<li class="empty-hint"><h3>Noch ein unbeschriebenes Blatt.</h3><p>Lieblingsorte, kleine Vorlieben, große Pläne.<br>Füge eure erste Erinnerung hinzu.</p></li>';list.querySelectorAll('[data-fact-id]').forEach(b=>b.onclick=()=>delFact(b.dataset.factId));}catch(e){if(list.isConnected)list.textContent='Erinnerungen konnten nicht geladen werden.';reportError(e);}
 }
-async function addFact(){
-  const f=$('factNew').value.trim(); if(!f) return;
-  const fd=new FormData(); fd.append('fact',f); fd.append('persona_id',personaId);
-  await api('/api/facts',{method:'POST',body:fd});
-  $('factNew').value=''; loadFacts(); toast('Merk ich mir');
+async function addFact(){const input=$('factNew'),text=input.value.trim();if(!text||!personaId)return;const fd=new FormData();fd.append('fact',text);fd.append('persona_id',personaId);try{await api('/api/facts',{method:'POST',body:fd});input.value='';loadFacts();toast('In Erinnerung behalten.');}catch(e){reportError(e);}}
+async function delFact(id){try{await api('/api/facts/'+encodeURIComponent(id),{method:'DELETE'});loadFacts();if($('factQ')?.value)searchFacts($('factQ').value);}catch(e){reportError(e);}}
+let searchVersion=0;
+async function searchFacts(q){const version=++searchVersion,results=$('factResults'),id=personaId;if(!results)return;if(!q.trim()){results.textContent='';return;}results.textContent='Suche läuft …';try{const hits=await api('/api/facts?q='+encodeURIComponent(q)+'&persona_id='+encodeURIComponent(id));if(version!==searchVersion||!results.isConnected||id!==personaId)return;results.innerHTML=hits.length?'<ul class="fact-list">'+hits.map(h=>'<li><p>'+esc(h.fact)+'</p></li>').join('')+'</ul>':'Keine passende Erinnerung gefunden.';}catch(e){if(results.isConnected)results.textContent='Die Suche ist gerade nicht verfügbar.';}}
+async function loadPersonas(preferredId=personaId){
+ personas=await api('/api/personas');
+ const selected=preferredId||localStorage.getItem('studioPersona');personaId=personas.some(p=>p.id===selected)?selected:personas[0]?.id||null;
+ $('persona').innerHTML=personas.length?personas.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join(''):'<option value="">Noch kein Kontakt</option>';
+ if(personaId)localStorage.setItem('studioPersona',personaId);CallSession.setPersona(personaId);updateContact();
 }
-async function delFact(id){ await api('/api/facts/'+id,{method:'DELETE'}); loadFacts(); }
-async function searchFacts(q){
-  if(!q.trim()){ $('factResults').textContent=''; return; }
-  const hits=await api('/api/facts?q='+encodeURIComponent(q)+'&persona_id='+personaId).catch(()=>[]);
-  $('factResults').innerHTML = hits.length
-    ? '<ul class="fact-list">'+hits.map(h=>`<li><div style="flex:1">${h.fact}</div></li>`).join('')+'</ul>'
-    : 'Nichts gefunden — Websuche würde im Dialog greifen.';
-}
-
-/* ================= boot ================= */
-async function loadPersonas(){
-  personas=await api('/api/personas');
-  $('persona').innerHTML=personas.map(p=>`<option value="${p.id}">${p.name}</option>`).join('');
-  personaId=localStorage.getItem('studioPersona');
-  if(!personas.find(p=>p.id===personaId)) personaId=personas[0]?.id;
-  if(personaId) $('persona').value=personaId;
-  // service health
-  api('/api/personas').catch(()=>{});
-  fetch('/api/health/omnivoice').then(r=>r.json()).then(d=>{
-    $('svc-omni').className='svc-dot '+(d.ok?'ok':'bad');
-  }).catch(()=>{ $('svc-omni').className='svc-dot bad'; });
-  fetch('/api/health/comfy').then(r=>r.json()).then(d=>{
-    $('svc-comfy').className='svc-dot '+(d.ok?'ok':'bad');
-  }).catch(()=>{ $('svc-comfy').className='svc-dot bad'; });
-}
-loadPersonas().then(()=>{
-  go((location.hash||'#facetime').slice(1));
+window.addEventListener('hashchange',()=>go(location.hash.slice(1)));
+window.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('txPanelFt')&&!$('txPanelFt').classList.contains('hidden'))toggleTranscript(false);});
+window.addEventListener('pagehide',()=>{if(modelPicker)pauseModelPicker(modelPicker);});
+window.addEventListener('pageshow',e=>{if(e.persisted&&modelPicker)resumeModelPicker(modelPicker);});
+document.addEventListener('visibilitychange',()=>{
+ const picker=modelPicker;if(!picker)return;
+ if(document.hidden)pauseModelPicker(picker);else resumeModelPicker(picker);
 });
+paintIcons();
+loadPersonas().then(()=>{renderFacetime();go((location.hash||'#facetime').slice(1));}).catch(e=>{$('callView').innerHTML='<div class="boot-error"><h1>Dein Studio ist gerade nicht erreichbar.</h1><p>Bitte prüfe die Verbindung und lade die Seite erneut.</p><button class="btn" onclick="location.reload()">Erneut versuchen</button></div>';reportError(e);});
 </script>
 </body>
 </html>

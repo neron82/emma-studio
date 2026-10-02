@@ -6,7 +6,6 @@ single-tenant.
 """
 from __future__ import annotations
 
-import copy
 import json
 import threading
 import time

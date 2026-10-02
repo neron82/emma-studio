@@ -1,9 +1,12 @@
+from uuid import uuid4
+
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
 from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConfigOutput
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
+from studio.agent.models import ModelEndpoint
 from studio.speech.chat import Chat
 
 
@@ -42,6 +45,24 @@ class RuntimeConfig(BaseModel):
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
     )
+
+    # Provider credentials belong to server-only state, never to session events
+    # or serialized pipeline messages.
+    _llm_endpoint: ModelEndpoint | None = PrivateAttr(default=None)
+    _llm_session_id: str = PrivateAttr(default_factory=lambda: uuid4().hex)
+
+    @property
+    def llm_endpoint(self) -> ModelEndpoint | None:
+        return self._llm_endpoint
+
+    @property
+    def llm_session_id(self) -> str:
+        return self._llm_session_id
+
+    def bind_llm(self, endpoint: ModelEndpoint, session_id: str | None = None) -> None:
+        self._llm_endpoint = endpoint
+        if session_id:
+            self._llm_session_id = session_id
 
     @field_validator("session", mode="after")
     @classmethod

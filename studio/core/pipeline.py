@@ -10,12 +10,11 @@ call_turn flow:
 """
 from __future__ import annotations
 
-import asyncio
-import random
 from pathlib import Path
 
 from ..agent import dialog as agent_dialog
 from ..agent import search as web_search
+from ..agent.models import resolve_endpoint
 from ..core.store import Store
 from ..render import comfy
 from ..speech import router as speech_router
@@ -48,16 +47,20 @@ async def _script_video_message(store: Store, job: dict) -> dict:
         f"image, and the exact spoken lines in {lang}. Keep it under 400 "
         "characters so the video stays short. No headings, no commentary."
     )
+    if facts:
+        lines = "\n".join(f"- {f['fact']}" for f in facts)
+        system += f"\n\nKnown facts about the viewer (use them, never contradict them):\n{lines}"
     import httpx
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": f"Topic for the video message:\n{job['user_input']}"},
     ]
+    endpoint = resolve_endpoint(persona)
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {},
-            json={"model": config.LLM_MODEL, "messages": messages},
+            f"{endpoint.base_url.rstrip('/')}/chat/completions",
+            headers=endpoint.headers(job["id"]),
+            json={"model": endpoint.model, "messages": messages},
         )
     if resp.status_code != 200:
         raise PipelineError(f"script LLM HTTP {resp.status_code}: {resp.text[:200]}")

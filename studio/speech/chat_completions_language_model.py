@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from threading import Lock
 from typing import Any, cast
 
-from openai import Stream
+from openai import OpenAI, Stream
 from openai.types.chat import (
     ChatCompletionChunk,
     ChatCompletionContentPartImageParam,
@@ -24,17 +25,20 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 from openai.types.responses import ResponseFunctionToolCall
 from openai.types.shared_params import FunctionDefinition
 
+from studio.agent.models import ModelEndpoint
 from studio.speech.base_openai_compatible_language_model import (
     WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
     ProviderEvent,
+    RequestFn,
     TextDelta,
     ToolCall,
     Usage,
+    _Turn,
 )
 from studio.speech.chat import Chat
-from studio.speech.compaction_prompt import CompactGenerateFn
+from studio.speech.compaction_prompt import CompactGenerateFn, build_compactor
 from studio.speech.core.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -275,15 +279,110 @@ def _iter_chat_response_events(api_response: Any) -> Iterator[ProviderEvent]:
     yield from _tool_calls_from_accum(tool_accum)
 
 
+class _EndpointClient:
+    """Retire pooled-session clients without closing an active provider request."""
+
+    def __init__(self, endpoint: ModelEndpoint) -> None:
+        self.client = OpenAI(base_url=endpoint.base_url, api_key=endpoint.api_key or "none")
+        self._lock = Lock()
+        self._users = 0
+        self._retired = False
+
+    def retain(self) -> Callable[[], None]:
+        with self._lock:
+            if self._retired:
+                raise RuntimeError("The language model session has ended.")
+            self._users += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            with self._lock:
+                if released:
+                    return
+                released = True
+                self._users -= 1
+                close = self._retired and self._users == 0
+            if close:
+                self.client.close()
+
+        return release
+
+    def retire(self) -> None:
+        with self._lock:
+            if self._retired:
+                return
+            self._retired = True
+            close = self._users == 0
+        if close:
+            self.client.close()
+
+
 class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
     """LLM handler that talks to an OpenAI-compatible ``/v1/chat/completions`` server.
 
-    Functionally mirrors :class:`ResponsesApiModelHandler` but uses the mature
-    Chat Completions streaming tool-call protocol (``choices[].delta.tool_calls``)
-    instead of ``/v1/responses``. This is the robust path for vLLM + Qwen tool
+    Uses the mature Chat Completions streaming tool-call protocol
+    (``choices[].delta.tool_calls``) — the robust path for vLLM + Qwen tool
     calling. The conversation is serialised with :meth:`Chat.to_transformers_chat`,
     which already emits OpenAI chat messages including ``tool_calls``/``tool`` roles.
     """
+
+    def setup(self, *args: Any, **kwargs: Any) -> None:
+        self._endpoint_clients: dict[ModelEndpoint, _EndpointClient] = {}
+        super().setup(*args, **kwargs)
+
+    def _bind_request(
+        self,
+        turn: _Turn,
+        request_fn: RequestFn | None,
+    ) -> tuple[RequestFn, Any, Callable[[], None], Callable[[], Callable[[], None]]]:
+        endpoint = turn.runtime_config.llm_endpoint
+        if endpoint is None:
+            return super()._bind_request(turn, request_fn)
+        route = self._endpoint_clients.get(endpoint)
+        if route is None:
+            route = _EndpointClient(endpoint)
+            self._endpoint_clients[endpoint] = route
+        release = route.retain()
+        # Capture endpoint and headers now: persona/session updates must not
+        # retarget a speculative worker or an asynchronous history compaction.
+        headers = endpoint.headers(turn.runtime_config.llm_session_id)
+        extra_body = (
+            None if endpoint.provider == "opencode-go"
+            else self._build_extra_body(endpoint.base_url, self.disable_thinking, self.reasoning_effort)
+        )
+
+        def request(api_input: Any, optional_kwargs: dict[str, Any]) -> Any:
+            return _request_chat_completions(
+                client=route.client,
+                model_name=endpoint.model,
+                messages=api_input,
+                stream=self.stream,
+                extra_body=extra_body,
+                timeout=self.request_timeout,
+                optional_kwargs={**optional_kwargs, "extra_headers": headers},
+            )
+
+        def generate(system: str, user: str) -> str:
+            finish = route.retain()
+            try:
+                response = route.client.chat.completions.create(
+                    model=endpoint.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    extra_headers=headers,
+                    extra_body=extra_body,
+                    timeout=self.request_timeout,
+                )
+                return response.choices[0].message.content or ""
+            finally:
+                finish()
+
+        compactor = build_compactor(generate) if self.compactor is not None else None
+        return request, compactor, release, route.retain
+
 
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
@@ -302,13 +401,12 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
 
     def _build_compaction_generate_fn(self) -> CompactGenerateFn:
         """Return a generate fn that calls Chat Completions for compaction."""
-        client = self.client
         model_name = self.model_name
         timeout = self.request_timeout
         extra_body = self._extra_body
 
         def generate(system: str, user: str) -> str:
-            response = client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system},
@@ -366,4 +464,11 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         yield from _tool_calls_from_accum(tool_accum)
 
     def on_session_end(self) -> None:
+        clients, self._endpoint_clients = self._endpoint_clients, {}
+        for route in clients.values():
+            route.retire()
         logger.debug("Chat Completions API language model session state reset")
+
+    def cleanup(self) -> None:
+        self.on_session_end()
+        super().cleanup()

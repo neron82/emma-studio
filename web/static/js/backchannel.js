@@ -5,7 +5,6 @@ Contract:
                                matching clip in the background (~100 ms).
   backchannel.play(delayMs)  — starts playback after `delayMs` (default 450).
   backchannel.cancel()       — answer arrived before/at filler end: stop it.
-  backchannel.stopIfPlaying()— used by the answer pipeline before first chunk.
 
 Race rules:
   - If the real answer's first chunk is ready before play() is called, never

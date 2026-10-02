@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Callable
 
 GATE_SPEECH = "speech"
 GATE_TRANSCRIBE = "transcribe"
@@ -54,9 +54,6 @@ class Cycle:
 
     def texts(self) -> list[str]:
         return [text for _, text in self.observations]
-
-    def summary_line(self, width: int = 90) -> str:
-        return f"{int(self.seconds):2d}s: {self.summary[:width]}"
 
 
 class VisualCycles:
@@ -148,13 +145,6 @@ class VisualCycles:
         cycles = [c for c in self._done if c.silent and c.summary]
         return cycles[-limit:] if limit else cycles
 
-    def open_cycle(self) -> Cycle | None:
-        return self._open
-
-    def describe_cycle(self, cycle: Cycle) -> str:
-        """Verlaufsblock für den Prompt (älteste zuerst)."""
-        return "\n".join(f"- {c.summary}" for c in self.history() if c.summary)
-
     @staticmethod
     def gate_for_event(event_type: str) -> str | None:
         """Pipeline-Event → Gate (None = kein Gate)."""
@@ -165,9 +155,3 @@ class VisualCycles:
         if event_type in ("assistant_text", "emma_viseme_timeline", "response_generation_done"):
             return GATE_RESPOND
         return None
-
-    def gates_of(self, cycles: Iterable[Cycle]) -> set[str]:
-        out: set[str] = set()
-        for cycle in cycles:
-            out |= cycle.gates
-        return out

@@ -47,12 +47,6 @@ SEARCH_ENABLED = os.getenv("STUDIO_SEARCH_ENABLED", "1") == "1"
 EMBED_URL = os.getenv("STUDIO_EMBED_URL", "http://127.0.0.1:7777")  # bge-m3
 EMBED_MODEL = os.getenv("STUDIO_EMBED_MODEL", "bge-m3")
 
-# --- Telegram -----------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("STUDIO_TG_BOT_TOKEN", "")
-TELEGRAM_ALLOWED_CHATS = {
-    int(x) for x in os.getenv("STUDIO_TG_ALLOWED_CHATS", "").replace(" ", "").split(",") if x
-}
-
 # --- Limits -------------------------------------------------------------------
 MAX_FACTS_PER_QUERY = 8
 SEARCH_TOP_K = 5
@@ -63,6 +57,11 @@ REALTIME_ENABLED = os.getenv("STUDIO_REALTIME", "1") == "1"
 REALTIME_POOL_SIZE = int(os.getenv("STUDIO_REALTIME_POOL_SIZE", "1"))
 REALTIME_CHAT_SIZE = int(os.getenv("STUDIO_REALTIME_CHAT_SIZE", "12"))
 REALTIME_LM_TIMEOUT_S = float(os.getenv("STUDIO_REALTIME_LM_TIMEOUT", "60"))
+
+# Schonfrist für "aktive" Call-Sessions ohne lebende Realtime-Verbindung: der
+# Client startet die Session, bevor er die WS aufbaut, und ein Neustart/Absturz
+# des Prozesses lässt die Session sonst für immer aktiv (Persona gesperrt).
+STALE_CALL_GRACE_S = float(os.getenv("STUDIO_STALE_CALL_GRACE", "90"))
 
 # VAD (silero via torch.hub cache)
 VAD_THRESH = float(os.getenv("STUDIO_VAD_THRESH", "0.6"))
@@ -113,7 +112,6 @@ VLM_DEVICE = os.getenv("STUDIO_VLM_DEVICE", "cuda:1")
 VLM_MAX_EDGE = int(os.getenv("STUDIO_VLM_MAX_EDGE", "512"))
 VLM_INTERVAL_S = float(os.getenv("STUDIO_VLM_INTERVAL", "1.0"))
 VLM_FRAME_MAX_AGE_S = float(os.getenv("STUDIO_VLM_FRAME_MAX_AGE", "3.0"))
-VLM_MAX_OBS = int(os.getenv("STUDIO_VLM_MAX_OBS", "180"))
 # Länge eines Verlaufs-Zyklus: alle 5 s wird aus den Sekunden-Beobachtungen eine
 # *temporale* Beschreibung ("erst neutral, dann Lächeln, dann hält sie einen
 # Stift hoch") erzeugt und gesammelt.

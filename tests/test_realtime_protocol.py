@@ -127,6 +127,44 @@ def test_persona_seeds_instructions_history_and_voice(session):
     assert "Hallo Emma" in str(first_user)
 
 
+def test_realtime_history_excludes_telegram_but_keeps_shared_memory(store, tmp_path, monkeypatch):
+    from studio import config
+    from studio.agent import memory
+
+    db, persona_id = store
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "memory")
+    telegram = db.create_session(persona_id, transport="telegram", transport_key="bot:1")
+    db.add_message(persona_id, "user", "Telegram private transcript", session_id=telegram["id"])
+    memory.append_summary(persona_id, "Shared memory: the user is planning a garden.", session=telegram)
+    unit = _make_unit(db)
+    conn_id = unit.service.register()
+    try:
+        assert unit.service._apply_persona(conn_id, persona_id) is None
+        cfg = unit.service._state(conn_id).runtime_config
+        live_history = "\n".join(str(item) for item in cfg.chat.buffer)
+        assert "Hallo Emma" in live_history
+        assert "Telegram private transcript" not in live_history
+        assert "the user is planning a garden" in cfg.session.instructions
+    finally:
+        unit.service.unregister(conn_id)
+
+
+def test_session_update_rejects_telegram_call_binding(session):
+    ws, unit, db, persona_id, conn_id = session
+    telegram = db.create_session(persona_id, transport="telegram", transport_key="bot:1")
+    ws.send_json({
+        "type": "session.update",
+        "event_id": "evt_telegram_session",
+        "session": {"type": "realtime", "session_id": telegram["id"]},
+    })
+    event = ws.receive_json()
+    assert event["type"] == "error"
+    assert event["error"]["type"] == "invalid_session_transport"
+    assert unit.service.conn_for_call_session(telegram["id"]) is None
+    unit.service._finalize_call_session(conn_id)
+    assert db.get_session(telegram["id"])["state"] == "active"
+
+
 def test_transcription_triggers_response_audio_and_persistence(session):
     ws, unit, db, persona_id, session_id = session
     unit.text_output_queue.put(SpeechStartedEvent(turn_id="t1", turn_revision=0))

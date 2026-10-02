@@ -26,7 +26,6 @@ from queue import Queue
 from threading import Event
 from typing import Any, Literal, Optional
 
-import httpx
 import numpy as np
 from openai.types.realtime import ConversationItemCreateEvent, RealtimeErrorEvent
 from pydantic import BaseModel, Field
@@ -34,6 +33,8 @@ from pydantic import BaseModel, Field
 from studio import config
 from studio.agent.dialog import build_system_prompt
 from studio.agent.memory import schedule_call_finalization
+from studio.agent.models import ModelConfigurationError, resolve_endpoint
+from studio.agent.search import search_sync
 from studio.core.store import Store
 from studio.deliver.realtime.emma_events import EmmaStatusEvent, EmmaVideoFrameEvent
 from studio.deliver.realtime.pipeline_unit import PipelineUnit
@@ -42,7 +43,8 @@ from studio.speech import stt, visemes, vlm
 from studio.speech.chat import make_assistant_message, make_user_message
 from studio.speech.chat_completions_language_model import ChatCompletionsApiModelHandler
 from studio.speech.silent_turn_processor import SilentTurnProcessor
-from studio.speech.visual_cycles import ALL_GATES, Cycle, VisualCycles
+from studio.speech.utils import whisper_language_code
+from studio.speech.visual_cycles import Cycle, VisualCycles
 from studio.speech.core.cancel_scope import CancelScope
 from studio.speech.core.events import AssistantOutputEvent, PipelineEvent
 from studio.speech.core.messages import EndOfResponse, GenerateResponseRequest, TTSInput
@@ -77,19 +79,6 @@ class VisemeTimelineEvent(PipelineEvent):
     turn_id: str | None = None
     turn_revision: int | None = None
     response_key: str | None = None
-
-
-class StatusEvent(PipelineEvent):
-    """Intern: eine Pipeline-Statuszeile → ``emma.status`` im Client.
-
-    Wird von beliebigen Threads (Analyzer, TTS) auf die text_output_queue
-    gelegt und vom Send-Loop in ein Wire-Event übersetzt.
-    """
-
-    type: Literal["emma_status"] = "emma_status"
-    stage: str = ""
-    detail: str = ""
-    ms: float | None = None
 
 
 class EmmaVisemeStamp(BaseModel):
@@ -190,11 +179,15 @@ class VisemeTTSHandler(OpenAICompatibleTTSHandler):
             floats = audio.astype(np.float32) / 32768.0
         else:
             floats = np.asarray(audio, dtype=np.float32)
-        lang = (tts_input.language_code or config.STT_LANGUAGE).split("-")[0]
+        lang = whisper_language_code(tts_input.language_code) or config.STT_LANGUAGE
         try:
             words = stt.transcribe_words_array(floats, language=lang)
-        except Exception as exc:
-            log_exception(logger, "viseme transcription failed", exc)
+        except Exception as exc:                           # noqa: BLE001
+            # Bewusst MIT Meldung (statt log_exception): dieser Pfad sieht
+            # ausschließlich synthetisiertes Audio, nie Gesprächsinhalt — und
+            # eine verschluckte Meldung hat die Fehlersuche schon einmal teuer
+            # gemacht (Whisper lehnt z.B. Klarnamen wie 'German' ab).
+            logger.error("viseme transcription failed (%s): %s", type(exc).__name__, exc)
             return None
         timeline = visemes.build_viseme_timeline(words)
         if not timeline:
@@ -234,26 +227,6 @@ _QUESTION_MARKERS = (
 def _looks_like_question(text: str) -> bool:
     t = text.strip().lower()
     return any(m in t for m in _QUESTION_MARKERS)
-
-
-def _web_search_sync(query: str) -> list[dict]:
-    """Synchronous SearXNG fetch (mirror of studio.agent.search.search)."""
-    if not config.SEARCH_ENABLED:
-        return []
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(
-                f"{config.SEARXNG_URL.rstrip('/')}/search",
-                params={"q": query, "format": "json"},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-    except (httpx.HTTPError, ValueError):
-        return []
-    return [
-        {"title": r.get("title", ""), "snippet": r.get("content", "")}
-        for r in (data.get("results") or [])[: config.SEARCH_TOP_K]
-    ]
 
 
 def _user_item_text(item: Any) -> str:
@@ -339,11 +312,18 @@ class EmmaRealtimeService(RealtimeService):
         self._silent_counters: dict[str, dict[str, int]] = {}     # answered/discarded
         self._silent_seq = 0
         self._persona_cache: dict[str, dict] = {}
+        self._prompt_generation: dict[str, int] = {}              # conn → newest turn's prompt build
         self._analyzer_thread: dict[str, threading.Thread] = {}
         self._analyzer_stop: dict[str, Event] = {}
         self._vlm_warned: set[str] = set()
 
     # ── persona ──────────────────────────────────────────────────────────
+
+    def register(self) -> str:
+        endpoint = resolve_endpoint()
+        conn_id = super().register()
+        self._state(conn_id).runtime_config.bind_llm(endpoint, conn_id)
+        return conn_id
 
     def handle_session_update(self, conn_id: str, event) -> Optional[RealtimeErrorEvent]:
         error = super().handle_session_update(conn_id, event)
@@ -358,11 +338,10 @@ class EmmaRealtimeService(RealtimeService):
         # Call-Session-Bindung (extra Feld ``session_id``): alle Nachrichten dieser
         # Verbindung werden mit der DB-Session getaggt; bei Trennung wird die
         # Session defensiv finalisiert.
-        self._apply_call_session(conn_id, extra.get("session_id"))
-        return None
+        return self._apply_call_session(conn_id, extra.get("session_id"))
 
-    def _apply_call_session(self, conn_id: str, session_id: Any) -> None:
-        """Verbindung mit einer DB-Call-Session binden (best effort).
+    def _apply_call_session(self, conn_id: str, session_id: Any) -> Optional[RealtimeErrorEvent]:
+        """Verbindung mit einer aktiven Facetime-Session derselben Persona binden.
 
         Nur aktive Sessions derselben Persona werden gebunden; alles andere wird
         abgelehnt und protokolliert. Die Bindung ist die Grundlage für das
@@ -375,6 +354,11 @@ class EmmaRealtimeService(RealtimeService):
         if row is None:
             logger.warning("session.update: unknown session_id %r — not bound", session_id)
             return
+        if row["transport"] != "facetime":
+            return self.make_error(
+                "Only Facetime sessions can bind to a realtime connection",
+                "invalid_session_transport",
+            )
         if row["state"] != "active":
             logger.warning("session.update: session %s is not active — not bound", session_id)
             return
@@ -384,18 +368,28 @@ class EmmaRealtimeService(RealtimeService):
             return
         self._call_release_events.setdefault(conn_id, threading.Event())
         self._call_session_by_conn[conn_id] = session_id
+        cfg = self._state(conn_id).runtime_config
+        if cfg.llm_endpoint is not None:
+            cfg.bind_llm(cfg.llm_endpoint, session_id)
         logger.info("Connection %s bound to call session %s", conn_id, session_id)
 
     def _apply_persona(self, conn_id: str, persona_id: str) -> Optional[RealtimeErrorEvent]:
         persona = self._store.get_persona(persona_id)
         if persona is None:
             return self.make_error(f"Unknown persona_id {persona_id!r}", "unknown_persona")
+        try:
+            endpoint = resolve_endpoint(persona)
+        except ModelConfigurationError as exc:
+            return self.make_error(str(exc), "invalid_model_configuration")
         st = self._state(conn_id)
         cfg = st.runtime_config
+        cfg.bind_llm(endpoint)
         self._persona_by_conn[conn_id] = persona_id
         self._persona_cache[conn_id] = persona
         seeded = 0
-        for row in reversed(self._store.get_history(persona_id, limit=2 * self._chat_size)):
+        for row in reversed(self._store.get_history(
+            persona_id, limit=2 * self._chat_size, transport="facetime"
+        )):
             content = (row.get("content") or "").strip()
             if not content:
                 continue
@@ -417,7 +411,8 @@ class EmmaRealtimeService(RealtimeService):
         self._last_persisted.pop(conn_id, None)
         self._stop_analyzer(conn_id)
         for store_ in (self._frame, self._described_frame_at, self._cycles,
-                       self._pending_cycles, self._silent_counters, self._persona_cache):
+                       self._pending_cycles, self._silent_counters, self._persona_cache,
+                       self._prompt_generation):
             store_.pop(conn_id, None)
         for key in [k for k, owner in self._silent_keys.items() if owner == conn_id]:
             self._silent_keys.pop(key, None)
@@ -645,6 +640,9 @@ class EmmaRealtimeService(RealtimeService):
         persona = self._persona_for(conn_id)
         if not persona or not bool(persona.get("silent_summary")):
             return
+        queue = self.text_prompt_queue
+        if queue is None:
+            return                                            # ohne Queue passiert nichts — Zustand unangetastet
         st = self._state(conn_id)
         if st.in_response or st.response_pending:
             return                                            # läuft schon etwas → nicht stören
@@ -669,9 +667,6 @@ class EmmaRealtimeService(RealtimeService):
         self._silent_user_items[request.response_key] = (conn_id, item.id)
         self._silent_keys[request.response_key] = conn_id
         st.mark_response_pending(request.response_key)
-        queue = self.text_prompt_queue
-        if queue is None:
-            return
         queue.put(request)
         self._status("SILENT", f"Zustandsbeschreibung gesendet ({cycle.seconds:.0f}s Verlauf)")
 
@@ -820,6 +815,11 @@ class EmmaRealtimeService(RealtimeService):
         persona = self._store.get_persona(persona_id)
         if persona is None:
             return
+        # Each turn owns a prompt generation. The background web search below
+        # writes into the *same* instructions field the next turn reads, so it
+        # must only land while its own turn is still the newest one.
+        generation = self._prompt_generation.get(conn_id, 0) + 1
+        self._prompt_generation[conn_id] = generation
         try:
             facts = self._store.search_facts(transcript, persona_id=persona_id, limit=config.SEARCH_TOP_K)
         except Exception as exc:
@@ -841,13 +841,19 @@ class EmmaRealtimeService(RealtimeService):
         )
         if _looks_like_question(transcript) and config.SEARCH_ENABLED:
             def _bg_search() -> None:
-                results = _web_search_sync(transcript)
-                if results:
-                    try:
-                        base = build_system_prompt(persona, facts, results)
-                        cfg.session.instructions = base + ("\n\n" + visual if visual else "")
-                    except Exception:
-                        pass
+                results = search_sync(transcript)
+                if not results:
+                    return
+                # A newer turn already rebuilt the prompt from fresher facts:
+                # dropping the late result beats overwriting that turn's facts.
+                if self._prompt_generation.get(conn_id) != generation:
+                    logger.debug("Late web result for a superseded turn %s discarded", conn_id)
+                    return
+                try:
+                    base = build_system_prompt(persona, facts, results)
+                    cfg.session.instructions = base + ("\n\n" + visual if visual else "")
+                except Exception:
+                    pass
             threading.Thread(target=_bg_search, daemon=True, name="emma-web-search").start()
 
     # ── assistant persistence ────────────────────────────────────────────
@@ -1014,6 +1020,9 @@ def _build_unit(index: int, stop_event: Event) -> PipelineUnit:
             "api_key": config.LLM_API_KEY or None,
             "gen_kwargs": {},
             "stream": True,
+            # Select the provider only after persona binding. A cloud-only call
+            # must not wait for (or fail because of) the configured local LLM.
+            "warmup_on_setup": False,
             # Empirically (22.08.): chat_template_kwargs.enable_thinking=false
             # empties minimax-m3's final content — never send provider extras.
             "disable_thinking": False,

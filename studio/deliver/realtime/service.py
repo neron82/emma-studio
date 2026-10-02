@@ -44,7 +44,7 @@ from openai.types.realtime.conversation_item_input_audio_transcription_completed
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from studio.deliver.realtime.emma_events import EmmaStatusEvent, EmmaVideoFrameEvent
+from studio.deliver.realtime.emma_events import EmmaVideoFrameEvent
 from studio.deliver.realtime.handlers import (
     AudioHandler,
     ConversationHandler,

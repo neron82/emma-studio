@@ -7,7 +7,8 @@ never agreed to. Content is therefore omitted by default: log sites pass transcr
 explicitly enabled.
 
 Full transcripts are still valuable when debugging STT, LLM, TTS and Realtime behaviour, so
-``--log_transcripts`` turns them back on for a run. The gate is a module-level flag set once
+``STUDIO_LOG_TRANSCRIPTS=1`` (or ``--log_transcripts`` on the module entry point) turns them
+back on for a run. The gate is a module-level flag set once
 at startup rather than a parameter threaded through every handler: the default has to be
 "off" everywhere, including in code paths that never think about it, and a single default-off
 switch cannot be missed by a new call site the way a constructor argument can.

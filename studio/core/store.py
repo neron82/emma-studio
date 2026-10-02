@@ -11,7 +11,6 @@ Design rules:
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
 import uuid
@@ -31,6 +30,9 @@ CREATE TABLE IF NOT EXISTS personas (
     language TEXT NOT NULL DEFAULT 'German',
     silent_summary INTEGER NOT NULL DEFAULT 1,   -- Kamera-Silent-Turns erlauben
     silent_ratio REAL NOT NULL DEFAULT 0.8,      -- Mindestanteil verworfener Silent-Turns
+    llm_provider TEXT NOT NULL DEFAULT 'configured',
+    llm_base_url TEXT NOT NULL DEFAULT '',
+    llm_model TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -62,7 +64,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at REAL NOT NULL,
     ended_at REAL,
     turn_count INTEGER NOT NULL DEFAULT 0,
-    summary TEXT                          -- LLM-Zusammenfassung, nach der Finalisierung
+    summary TEXT,                         -- LLM-Zusammenfassung, nach der Finalisierung
+    transport TEXT NOT NULL DEFAULT 'facetime',
+    transport_key TEXT,
+    llm_provider TEXT NOT NULL DEFAULT '',
+    llm_base_url TEXT NOT NULL DEFAULT '',
+    llm_model TEXT NOT NULL DEFAULT '',
+    llm_override INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_persona ON sessions(persona_id, started_at DESC);
 
@@ -143,9 +151,39 @@ class Store:
         for name, ddl in (
             ("silent_summary", "ALTER TABLE personas ADD COLUMN silent_summary INTEGER NOT NULL DEFAULT 1"),
             ("silent_ratio", "ALTER TABLE personas ADD COLUMN silent_ratio REAL NOT NULL DEFAULT 0.8"),
+            ("llm_provider", "ALTER TABLE personas ADD COLUMN llm_provider TEXT NOT NULL DEFAULT 'configured'"),
+            ("llm_base_url", "ALTER TABLE personas ADD COLUMN llm_base_url TEXT NOT NULL DEFAULT ''"),
+            ("llm_model", "ALTER TABLE personas ADD COLUMN llm_model TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in cols:
                 self.conn.execute(ddl)
+        session_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        for name, definition in (
+            ("transport", "TEXT NOT NULL DEFAULT 'facetime'"),
+            ("transport_key", "TEXT"),
+            ("llm_provider", "TEXT NOT NULL DEFAULT ''"),
+            ("llm_base_url", "TEXT NOT NULL DEFAULT ''"),
+            ("llm_model", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in session_cols:
+                self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
+        if "llm_override" not in session_cols:
+            # Keep the column and legacy selection backfill atomic and one-time.
+            with self.conn:
+                self.conn.execute("SAVEPOINT session_llm_override")
+                self.conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN llm_override INTEGER NOT NULL DEFAULT 0"
+                )
+                self.conn.execute(
+                    "UPDATE sessions SET llm_override=1"
+                    " WHERE llm_provider NOT IN ('', 'configured')"
+                    " OR llm_base_url<>'' OR llm_model<>''"
+                )
+                self.conn.execute("RELEASE session_llm_override")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_transport_key"
+            " ON sessions(transport, transport_key, state, started_at DESC)"
+        )
         msg_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
         if "session_id" not in msg_cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN session_id TEXT REFERENCES sessions(id)")
@@ -163,15 +201,18 @@ class Store:
                        voice_profile: str | None = None,
                        vrm_model: str | None = None, language: str = "German",
                        silent_summary: bool | int = True,
-                       silent_ratio: float = 0.8) -> dict:
+                       silent_ratio: float = 0.8, llm_provider: str = "configured",
+                       llm_base_url: str = "", llm_model: str = "") -> dict:
         now = _now()
         pid = _uid()
         self.conn.execute(
             "INSERT INTO personas (id, name, personality_prompt, ref_image, voice_sample,"
             " voice_profile, vrm_model, language, silent_summary, silent_ratio,"
-            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " llm_provider, llm_base_url, llm_model, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, name, personality_prompt, ref_image, voice_sample, voice_profile,
              vrm_model, language, 1 if silent_summary else 0, _clamp_ratio(silent_ratio),
+             llm_provider, "" if llm_provider == "opencode-go" else llm_base_url, llm_model,
              now, now),
         )
         self.conn.commit()
@@ -187,12 +228,17 @@ class Store:
 
     def update_persona(self, persona_id: str, **fields) -> dict | None:
         allowed = {"name", "personality_prompt", "ref_image", "voice_sample", "voice_profile",
-                   "vrm_model", "language", "silent_summary", "silent_ratio"}
+                   "vrm_model", "language", "silent_summary", "silent_ratio",
+                   "llm_provider", "llm_base_url", "llm_model"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if "silent_summary" in sets:
             sets["silent_summary"] = 1 if _as_bool(sets["silent_summary"]) else 0
         if "silent_ratio" in sets:
             sets["silent_ratio"] = _clamp_ratio(sets["silent_ratio"])
+        if {"llm_provider", "llm_base_url", "llm_model"} & sets.keys():
+            current = self.get_persona(persona_id)
+            if current and sets.get("llm_provider", current["llm_provider"]) == "opencode-go":
+                sets["llm_base_url"] = ""
         if not sets:
             return self.get_persona(persona_id)
         sets["updated_at"] = _now()
@@ -282,7 +328,10 @@ class Store:
         except sqlite3.OperationalError:
             rows = []  # malformed FTS query — never crash the dialog on this
         for rank, r in enumerate(rows):
-            # earlier ranks score higher; persona-scoped facts get a boost
+            # earlier ranks score higher. Keyword hits score above the capped
+            # semantic-only hits (0.9 max) by design; of the keyword hits, the
+            # requesting persona's own facts and the global ones are boosted,
+            # facts of *other* personas are not.
             boost = 1.0 if not r["persona_id"] or r["persona_id"] == persona_id else 0.0
             results[r["id"]] = ((len(rows) - rank) / len(rows) + boost, dict(r))
 
@@ -354,21 +403,37 @@ class Store:
         return {"id": mid, "persona_id": persona_id, "session_id": session_id,
                 "role": role, "content": content, "job_id": job_id}
 
-    def get_history(self, persona_id: str, limit: int = 20) -> list[dict]:
+    def get_history(self, persona_id: str, limit: int = 20,
+                    *, transport: str = "facetime") -> list[dict]:
+        """Recent turns for one transport; legacy unscoped turns belong to Facetime."""
         rows = self.conn.execute(
-            "SELECT * FROM messages WHERE persona_id=? ORDER BY created_at DESC LIMIT ?",
-            (persona_id, limit),
+            "SELECT messages.* FROM messages"
+            " LEFT JOIN sessions ON sessions.id=messages.session_id"
+            " WHERE messages.persona_id=?"
+            " AND (sessions.transport=? OR (messages.session_id IS NULL AND ?='facetime'))"
+            " ORDER BY messages.created_at DESC LIMIT ?",
+            (persona_id, transport, transport, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
-    # -- sessions (Facetime-Calls) -------------------------------------------
+    # -- sessions (persistent transport conversations) -----------------------
 
-    def create_session(self, persona_id: str) -> dict:
+    def create_session(self, persona_id: str, *, transport: str = "facetime",
+                       transport_key: str | None = None,
+                       model_settings: dict | None = None,
+                       model_override: bool = False) -> dict:
+        """Persist a model snapshot; only an explicit override pins Telegram routing."""
         sid = _uid()
         now = _now()
+        selection = model_settings if model_settings is not None else self.get_persona(persona_id)
+        selection = selection or {}
         self.conn.execute(
-            "INSERT INTO sessions (id, persona_id, state, started_at) VALUES (?,?, 'active', ?)",
-            (sid, persona_id, now),
+            "INSERT INTO sessions (id, persona_id, state, started_at, transport, transport_key,"
+            " llm_provider, llm_base_url, llm_model, llm_override)"
+            " VALUES (?,?, 'active', ?,?,?,?,?,?,?)",
+            (sid, persona_id, now, transport, transport_key,
+             selection.get("llm_provider", ""), selection.get("llm_base_url", ""),
+             selection.get("llm_model", ""), 1 if model_override else 0),
         )
         self.conn.commit()
         return self.get_session(sid)
@@ -377,16 +442,53 @@ class Store:
         row = self.conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
         return dict(row) if row else None
 
-    def list_sessions(self, persona_id: str | None = None, limit: int = 50) -> list[dict]:
+    def get_transport_session(self, transport: str, transport_key: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE transport=? AND transport_key=? AND state='active'"
+            " ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (transport, transport_key),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_session_model(self, session_id: str, *, llm_provider: str,
+                             llm_base_url: str, llm_model: str,
+                             model_override: bool = True,
+                             expected_persona_selection: dict | None = None) -> dict | None:
+        """Set the override, rejecting a stale persona snapshot when supplied."""
+        sql = (
+            "UPDATE sessions SET llm_provider=?, llm_base_url=?, llm_model=?, llm_override=?"
+            " WHERE id=?"
+        )
+        params = (llm_provider, llm_base_url, llm_model, 1 if model_override else 0, session_id)
+        if expected_persona_selection is not None:
+            sql += (
+                " AND EXISTS (SELECT 1 FROM personas WHERE personas.id=sessions.persona_id"
+                " AND personas.llm_provider=? AND personas.llm_base_url=? AND personas.llm_model=?)"
+            )
+            params += tuple(expected_persona_selection[name] for name in (
+                "llm_provider", "llm_base_url", "llm_model"
+            ))
+        updated = self.conn.execute(sql, params)
+        self.conn.commit()
+        if updated.rowcount == 0:
+            return None
+        return self.get_session(session_id)
+
+    def list_sessions(self, persona_id: str | None = None, limit: int = 50,
+                      *, transport: str | None = None) -> list[dict]:
+        filters: list[str] = []
+        params: list = []
         if persona_id:
-            rows = self.conn.execute(
-                "SELECT * FROM sessions WHERE persona_id=? ORDER BY started_at DESC LIMIT ?",
-                (persona_id, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            filters.append("persona_id=?")
+            params.append(persona_id)
+        if transport is not None:
+            filters.append("transport=?")
+            params.append(transport)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        rows = self.conn.execute(
+            "SELECT * FROM sessions" + where + " ORDER BY started_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def session_transcript(self, session_id: str, limit: int | None = None) -> list[dict]:

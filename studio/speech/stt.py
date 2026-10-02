@@ -15,6 +15,12 @@ and sequential inference never OOMs). All model work therefore runs on ONE
 dedicated owner thread, which also serializes the concurrent callers that
 exist in practice (realtime STT handler, viseme TTS handler, /api/stt).
 Sequential cost is ~0.15 s per short chunk, so serialization is cheap.
+
+Device sharing — important: the VLM (``vlm.py``, Moondream on the same device)
+allocates ~23 GB in its cold start. Whisper inference must not run in that
+window, otherwise the CUDA-graph capture inside CTranslate2 fails and kills
+the process (see ``core/device_lock.py``). Hence every load/inference here
+runs under ``DEVICE_LOCK``.
 """
 from __future__ import annotations
 
@@ -25,6 +31,7 @@ from typing import Any
 import numpy as np
 
 from .. import config
+from .core.device_lock import DEVICE_LOCK
 
 STT_LANGUAGE = config.STT_LANGUAGE  # pinned — never auto-detect on short mic chunks
 
@@ -44,12 +51,13 @@ def _load_model():
         if config.STT_DEVICE == "cuda":
             _preload_cuda_libs()
         from faster_whisper import WhisperModel
-        _model = WhisperModel(
-            config.STT_MODEL,
-            device=config.STT_DEVICE,
-            device_index=config.STT_DEVICE_INDEX,
-            compute_type="float16" if config.STT_DEVICE == "cuda" else "int8",
-        )
+        with DEVICE_LOCK:                       # nicht parallel zum VLM-Kaltstart
+            _model = WhisperModel(
+                config.STT_MODEL,
+                device=config.STT_DEVICE,
+                device_index=config.STT_DEVICE_INDEX,
+                compute_type="float16" if config.STT_DEVICE == "cuda" else "int8",
+            )
     return _model
 
 
@@ -86,8 +94,11 @@ def bound_model() -> _BoundModel:
 def _transcribe_on_owner(source: Any, kwargs: dict[str, Any]):
     # Materialize the segments: faster-whisper decodes lazily while the returned
     # generator is consumed, and that work must stay on the owner thread.
-    segments, info = _load_model().transcribe(source, **kwargs)
-    return list(segments), info
+    # DEVICE_LOCK: ein paralleler VLM-Kaltstart auf demselben Gerät reißt den
+    # Prozess mit — siehe core/device_lock.py.
+    with DEVICE_LOCK:
+        segments, info = _load_model().transcribe(source, **kwargs)
+        return list(segments), info
 
 
 def transcribe_segments(source: Any, **kwargs: Any) -> tuple[list, Any]:
@@ -137,35 +148,6 @@ def transcribe(audio_path: Path, *, language: str | None = STT_LANGUAGE) -> str:
         str(path),
         language=language,                 # pinned 'de' — see module docstring
         beam_size=5,
-        condition_on_previous_text=False,
-        vad_filter=False,
-    )
-    return " ".join(s.text.strip() for s in segments).strip()
-
-
-def transcribe_words(audio_path: Path, *, language: str | None = STT_LANGUAGE) -> list[dict]:
-    """Wort-Timestamps für Lip-Sync: [{'word','start','end'}] in Sekunden.
-    Für kurze TTS-Chunks (1-6 s) auf der 3060 Ti im Bereich von Zehntelsekunden."""
-    path = Path(audio_path)
-    if not path.is_file():
-        raise STTError(f"audio file not found: {path}")
-    segments, _info = transcribe_segments(
-        str(path),
-        language=language,
-        beam_size=1,                       # Timestamps brauchen kein Beam-5
-        condition_on_previous_text=False,
-        vad_filter=False,
-        word_timestamps=True,
-    )
-    return _words_from_segments(segments)
-
-
-def transcribe_array(audio: Any, *, language: str | None = STT_LANGUAGE) -> str:
-    """Transcribe a 16 kHz float32 mono array (realtime buffers, no temp file)."""
-    segments, _info = transcribe_segments(
-        np.asarray(audio, dtype=np.float32),
-        language=language,
-        beam_size=1,
         condition_on_previous_text=False,
         vad_filter=False,
     )

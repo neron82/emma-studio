@@ -143,8 +143,7 @@ class _GenState(BaseModel):
 
 
 class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
-    """Shared lifecycle for OpenAI-compatible LLM backends (Responses & Chat
-    Completions).
+    """Shared lifecycle for OpenAI-compatible Chat Completions LLM backends.
 
     Subclasses implement four hooks — :meth:`warmup`,
     :meth:`_build_compaction_generate_fn`, :meth:`_serialize`, :meth:`_request`,
@@ -177,6 +176,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         audio_temperature: float = 0.0,
         audio_content_type: Literal["input_audio", "audio_url"] = "input_audio",
         audio_history_turns: int = 1,
+        warmup_on_setup: bool = True,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
@@ -193,6 +193,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.audio_content_type = audio_content_type
         self.audio_history_turns = max(0, audio_history_turns)
         self.reasoning_effort = reasoning_effort
+        self.disable_thinking = disable_thinking
         self.request_timeout_s = float(request_timeout_s)
         self.request_timeout = httpx.Timeout(
             self.request_timeout_s,
@@ -207,13 +208,32 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             and self._is_local_base_url(base_url)
         ):
             api_key = "none"
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client_api_key = api_key
+        self._client_base_url = base_url
+        self._client_lock = Lock()
+        self._client: OpenAI | None = (
+            OpenAI(api_key=api_key, base_url=base_url) if warmup_on_setup else None
+        )
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self._prefetch_worker_slots = BoundedSemaphore(PREFETCH_PROVIDER_WORKER_LIMIT)
         self._prefetch_workers_lock = Lock()
         self._prefetch_workers: set[Thread] = set()
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
-        self.warmup()
+        if warmup_on_setup:
+            self.warmup()
+
+    @property
+    def client(self) -> OpenAI:
+        """Create the configured client only when that route is actually used."""
+        if self._client is None:
+            with self._client_lock:
+                if self._client is None:
+                    self._client = OpenAI(api_key=self._client_api_key, base_url=self._client_base_url)
+        return self._client
+
+    @client.setter
+    def client(self, client: OpenAI) -> None:
+        self._client = client
 
     @staticmethod
     def _is_official_openai(base_url: Optional[str]) -> bool:
@@ -408,6 +428,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         request: Callable[[], Any],
         event_iterator: Callable[[Any], Iterator[ProviderEvent]],
         turn: _Turn,
+        release_client: Callable[[], None] | None = None,
     ) -> Iterator[ProviderEvent]:
         """Connect and consume one prefetch in a single bounded worker."""
         transaction = turn.prefetch_transaction
@@ -448,9 +469,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 return
             finally:
                 self._close_response(api_response)
+                if release_client is not None:
+                    release_client()
             publish((True, done))
 
-        worker = self._start_prefetch_worker(connect_and_read_events, name="realtime-tool-prefetch")
+        try:
+            worker = self._start_prefetch_worker(connect_and_read_events, name="realtime-tool-prefetch")
+        except BaseException:
+            if release_client is not None:
+                release_client()
+            raise
+        if worker is None and release_client is not None:
+            # The fallback request below runs on the main generation lease.
+            release_client()
         if worker is None:
             # discard() and claim() share one transaction lock. Calling discard
             # first makes the decision atomic: an already-claimed response stays
@@ -731,6 +762,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     # ── orchestration ─────────────────────────────────────────────────────────
 
+    def _bind_request(
+        self,
+        turn: _Turn,
+        request_fn: RequestFn | None,
+    ) -> tuple[RequestFn, Any, Callable[[], None], Callable[[], Callable[[], None]]]:
+        """Snapshot the provider route and retain its client for this generation."""
+        return request_fn or self._request, self.compactor, lambda: None, lambda: lambda: None
+
     def _generate(
         self,
         active_chat: Chat,
@@ -753,6 +792,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         transaction_rolled_back = False
         provider_request_started = False
         consumed_image_ids: set[str] = set()
+        release_client: Callable[[], None] | None = None
 
         def rollback_transaction() -> None:
             nonlocal transaction_rolled_back
@@ -770,6 +810,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             try:
+                bound_request, compactor, release_client, retain_client = self._bind_request(turn, request_fn)
                 api_input = (serialize_fn or self._serialize)(active_chat)
                 # Images the model actually sees this turn; only these are stripped on
                 # write-back, so an image a fast client injects mid-generation for the
@@ -784,13 +825,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     provider_request_started = True
 
                     def make_request() -> Any:
-                        return (request_fn or self._request)(api_input, optional_kwargs)
+                        return bound_request(api_input, optional_kwargs)
 
                     if turn.prefetch_transaction is not None:
                         events = self._iter_prefetch_events_interruptibly(
                             make_request,
                             event_iterator_fn or self._iter_events,
                             turn,
+                            release_client=retain_client(),
                         )
                     else:
                         api_response = make_request()
@@ -875,7 +917,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                                     original_chat.strip_images(consumed_image_ids)
                                     if history_commit_fn is not None:
                                         history_commit_fn()
-                                    original_chat.trim_if_needed(self.compactor)
+                                    original_chat.trim_if_needed(compactor)
                                 except Exception:
                                     original_chat.restore_history_cleanup(snapshot)
                                     raise
@@ -916,12 +958,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # Publish failure to the shared transaction before the queued
                 # logical-done event can race the client's response.create.
                 turn.prefetch_transaction.discard()
+            self._close_response(events)
             if api_response is not None and hasattr(api_response, "close"):
                 try:
                     api_response.close()
                 except Exception:
                     pass
             rollback_transaction()
+            if release_client is not None:
+                release_client()
+
+    def cleanup(self) -> None:
+        if self._client is not None:
+            self._client.close()
 
     def _process_audio(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process an audio-input turn through the selected backend protocol."""
