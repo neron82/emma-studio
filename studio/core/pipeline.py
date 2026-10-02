@@ -152,7 +152,7 @@ async def run_call_turn(store: Store, job: dict, history: list[dict]) -> dict:
         t0 = _time.monotonic()
         reply = await agent_dialog.chat(
             persona, history, job["user_input"],
-            facts[: config.MAX_FACTS_PER_QUERY], search_results,
+            facts[: config.MAX_FACTS_PER_QUERY], search_results, store=store,
         )
         timings["llm"] = round(_time.monotonic() - t0, 3)
         job = store.set_job_state(job["id"], "scripted", script=reply)

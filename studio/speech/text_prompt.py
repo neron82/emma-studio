@@ -13,7 +13,7 @@ TEXT_SYSTEM_PROMPT_TAIL = """\
 - This is a written channel: no spoken-style filler and no action/emote text like *laughs*.
 - Use tools when they help fulfill the request. No preamble sentence is required before a tool call.
 - For slow or external tools, just call the tool and use the result; you don't need to announce it.
-- If unsure whether a tool is needed, just answer directly.
+- For missing context about past user interactions, follow the memory retrieval instructions.
 """
 
 # Skeleton for the assembled system message (placeholders filled in build_text_system_prompt).

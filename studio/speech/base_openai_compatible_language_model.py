@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import ipaddress
+import json
 import logging
 import os
 import wave
@@ -21,6 +22,7 @@ from openai import OpenAI
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
+    RealtimeConversationItemFunctionCallOutput,
 )
 from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
@@ -57,7 +59,11 @@ from studio.speech.core.messages import (
 )
 from studio.speech.core.speculative_turns import SpeculativeTurnTracker
 from studio.speech.core.transcript_logging import log_exception, transcript_for_log
-from studio.speech.core.utils import is_out_of_band, response_wants_audio
+from studio.speech.core.utils import is_out_of_band, response_wants_audio, _generate_id
+
+from studio.agent.memory_tools import (
+    MAX_MEMORY_CALLS, LIMIT_INSTRUCTION, LIMIT_FALLBACK, parse_memory_call, result_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -770,6 +776,77 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Snapshot the provider route and retain its client for this generation."""
         return request_fn or self._request, self.compactor, lambda: None, lambda: lambda: None
 
+    def _memory_events(
+        self, events: Iterator[ProviderEvent], active_chat: Chat, turn: _Turn,
+        request: RequestFn, optional_kwargs: dict[str, Any],
+        serialize: SerializeFn, iterator: EventIteratorFn,
+    ) -> Iterator[ProviderEvent]:
+        """Keep retrieval turns private, including stray prose and provider tool events.
+
+        History gets only the final answer. Private calls/results remain in this
+        generation's snapshot; cancellation cannot leave pending calls behind.
+        """
+        executor = turn.runtime_config.memory_executor
+        if executor is None:
+            yield from events
+            return
+        input_tokens = output_tokens = 0
+        for count in range(MAX_MEMORY_CALLS + 1):
+            buffered = []
+            call = None
+            for event in events:
+                if isinstance(event, Usage):
+                    input_tokens += event.input_tokens
+                    output_tokens += event.output_tokens
+                    yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+                else:
+                    buffered.append(event)
+                if self._turn_is_cancelled(turn) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
+                    yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+                    return
+            text = ''.join(e.text for e in buffered if isinstance(e, TextDelta))
+            # Some providers supply only a completed message.
+            if not text:
+                text = ''.join(c.text or '' for e in buffered if isinstance(e, AssistantMessage) for c in e.content)
+            call = parse_memory_call(text)
+            for event in buffered:
+                if isinstance(event, ToolCall):
+                    call = call or parse_memory_call(json.dumps({
+                        'name': event.item.name, 'arguments': event.item.arguments}))
+            if call is None:
+                yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+                yield from buffered
+                return
+            if count == MAX_MEMORY_CALLS:
+                yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+                yield AssistantMessage(content=[AssistantContent(type='output_text', text=LIMIT_FALLBACK)])
+                yield TextDelta(text=LIMIT_FALLBACK)
+                return
+            result = executor(call)
+            if self._turn_is_cancelled(turn) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
+                return
+            call_id = _generate_id('call')
+            active_chat.add_item(RealtimeConversationItemFunctionCall(
+                type='function_call', name=call.name, call_id=call_id,
+                arguments=json.dumps(call.arguments)))
+            active_chat.add_item(RealtimeConversationItemFunctionCallOutput(
+                type='function_call_output', call_id=call_id,
+                output=result_block(call, result, count + 1)))
+            if count + 1 == MAX_MEMORY_CALLS:
+                instructions = active_chat.init_chat_message
+                original = '\n'.join(c.text or '' for c in instructions.content) if instructions else ''
+                active_chat.add_item(make_system_message(original + '\n\n' + LIMIT_INSTRUCTION))
+
+            def followup_events():
+                response = request(serialize(active_chat), optional_kwargs)
+                try:
+                    yield from iterator(response)
+                finally:
+                    close = getattr(response, 'close', None)
+                    if close is not None:
+                        close()
+            events = followup_events()
+
     def _generate(
         self,
         active_chat: Chat,
@@ -838,6 +915,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         api_response = make_request()
                         events = (event_iterator_fn or self._iter_events)(api_response)
                 if events is not None:
+                    events = self._memory_events(
+                        events, active_chat, turn, bound_request, optional_kwargs,
+                        serialize_fn or self._serialize, event_iterator_fn or self._iter_events)
                     if self.stream:
                         generation_completed = yield from self._consume_streaming(events, state, turn)
                     else:

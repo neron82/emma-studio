@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from studio import config
 from studio.agent.dialog import build_system_prompt
+from studio.agent.memory_tools import execute_memory_call
 from studio.agent.memory import schedule_call_finalization
 from studio.agent.models import ModelConfigurationError, resolve_endpoint
 from studio.agent.search import search_sync
@@ -384,6 +385,7 @@ class EmmaRealtimeService(RealtimeService):
         st = self._state(conn_id)
         cfg = st.runtime_config
         cfg.bind_llm(endpoint)
+        cfg.bind_memory(lambda call: execute_memory_call(self._store, persona_id, call))
         self._persona_by_conn[conn_id] = persona_id
         self._persona_cache[conn_id] = persona
         seeded = 0
@@ -398,7 +400,7 @@ class EmmaRealtimeService(RealtimeService):
             else:
                 cfg.chat.add_item(make_assistant_message(content))
             seeded += 1
-        cfg.session.instructions = build_system_prompt(persona, [], None)
+        cfg.session.instructions = build_system_prompt(persona, [], None, store=self._store)
         voice = persona.get("voice_profile") or self._default_voice
         if cfg.session.audio is not None and cfg.session.audio.output is not None:
             cfg.session.audio.output.voice = voice
@@ -648,7 +650,7 @@ class EmmaRealtimeService(RealtimeService):
             return                                            # läuft schon etwas → nicht stören
         cfg = st.runtime_config
         cfg.session.instructions = (
-            build_system_prompt(persona, [], None)
+            build_system_prompt(persona, [], None, store=self._store)
             + "\n\n"
             + self._silent_framing(conn_id, persona)
         )
@@ -827,7 +829,7 @@ class EmmaRealtimeService(RealtimeService):
             # silently: a programming error here would look like "no facts".
             log_exception(logger, "fact search failed", exc)
             facts = []
-        cfg.session.instructions = build_system_prompt(persona, facts, None)
+        cfg.session.instructions = build_system_prompt(persona, facts, None, store=self._store)
         visual = self._visual_context(conn_id)
         if visual:
             # Turn-complete-Injektion: der Analyzer-Thread hat die Zeile schon
@@ -850,7 +852,7 @@ class EmmaRealtimeService(RealtimeService):
                     logger.debug("Late web result for a superseded turn %s discarded", conn_id)
                     return
                 try:
-                    base = build_system_prompt(persona, facts, results)
+                    base = build_system_prompt(persona, facts, results, store=self._store)
                     cfg.session.instructions = base + ("\n\n" + visual if visual else "")
                 except Exception:
                     pass

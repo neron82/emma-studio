@@ -252,6 +252,20 @@ Kamera-Bildanalyse bleiben lokal und benötigen weiterhin ihre bisherigen Dienst
   Zum Debuggen: `STUDIO_LOG_TRANSCRIPTS=1` setzen bzw. `python -m studio --log_transcripts`
   — dann stehen die Transkripte im Journal und bleiben dort.
 
+## Avatar memory
+
+Full Telegram and Facetime transcripts and summaries are searchable in the existing
+SQLite database. Each session has a six-character memory ID shown before its
+summary in the persona prompt. The avatar can search across its history or within
+one session, then read exact paginated conversation text. Memory calls and results
+stay private; up to five calls are allowed before the final user-facing answer.
+
+Retrieval uses Unicode-aware FTS5 keyword search without another service or GPU
+model. Memory-enabled voice turns buffer model output before speech so tool JSON
+and stray search preambles cannot be spoken. See
+[the architecture and tool protocol](docs/memory-architecture.md) for migration,
+limits, extension points and tests.
+
 ## Tests
 
 ```bash

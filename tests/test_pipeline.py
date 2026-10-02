@@ -39,7 +39,7 @@ def test_call_turn_with_facts(store, persona):
     store.add_fact("User has a dog named Bruno", persona_id=persona["id"])
     job = store.create_job(persona["id"], "call_turn", "Wie heißt mein Hund?")
 
-    async def fake_chat(persona, history, msg, facts, search_results=None):
+    async def fake_chat(persona, history, msg, facts, search_results=None, *, store=None):
         assert any("Bruno" in f["fact"] for f in facts), "fact card must reach the agent"
         assert search_results is None, "no web search when facts match"
         return "Dein Hund heißt Bruno."
@@ -59,7 +59,7 @@ def test_call_turn_web_fallback_on_question(store, persona):
     async def fake_search(q, **kw):
         return [{"title": "Time", "snippet": "Tokio: UTC+9"}]
 
-    async def fake_chat(persona, history, msg, facts, search_results=None):
+    async def fake_chat(persona, history, msg, facts, search_results=None, *, store=None):
         assert search_results and "Tokio" in search_results[0]["snippet"]
         return "In Tokio ist es jetzt X."
 
@@ -77,7 +77,7 @@ def test_call_turn_no_search_for_smalltalk(store, persona):
     async def fail_search(q, **kw):
         raise AssertionError("search must not run for smalltalk")
 
-    async def fake_chat(persona, history, msg, facts, search_results=None):
+    async def fake_chat(persona, history, msg, facts, search_results=None, *, store=None):
         return "Hallo!"
 
     with patch.object(pipeline.agent_dialog, "chat", fake_chat), \

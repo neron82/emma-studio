@@ -445,7 +445,7 @@ class TelegramTransport:
         facts = await asyncio.to_thread(self.store.search_facts, text, persona_id=persona["id"])
         self.store.add_message(persona["id"], "user", text, session_id=session["id"])
         try:
-            response = await dialog.chat(persona, history, text, facts, session_id=session["id"])
+            response = await dialog.chat(persona, history, text, facts, session_id=session["id"], store=self.store)
             if not isinstance(response, str) or not response.strip():
                 raise ValueError("empty reply")
         except Exception as exc:

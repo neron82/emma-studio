@@ -1,4 +1,5 @@
 from uuid import uuid4
+from typing import Callable
 
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
@@ -48,6 +49,15 @@ class RuntimeConfig(BaseModel):
 
     # Provider credentials belong to server-only state, never to session events
     # or serialized pipeline messages.
+    _memory_executor: Callable | None = PrivateAttr(default=None)
+
+    @property
+    def memory_executor(self):
+        return self._memory_executor
+
+    def bind_memory(self, executor: Callable) -> None:
+        self._memory_executor = executor
+
     _llm_endpoint: ModelEndpoint | None = PrivateAttr(default=None)
     _llm_session_id: str = PrivateAttr(default_factory=lambda: uuid4().hex)
 

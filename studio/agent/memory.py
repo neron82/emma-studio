@@ -85,8 +85,8 @@ def count_words(text: str) -> int:
 def _entry_header(session: dict | None, fallback_ts: float | None = None) -> str:
     ts = (session or {}).get("started_at") or fallback_ts or time.time()
     when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    sid = (session or {}).get("id", "?")
-    return f"{_ENTRY_PREFIX}{when} — Call #{str(sid)[:8]}"
+    sid = (session or {}).get("memory_id") or (session or {}).get("id", "?")
+    return f"{_ENTRY_PREFIX}Session {sid} — {when}"
 
 
 def append_summary(persona_id: str, summary: str, session: dict | None = None,

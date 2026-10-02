@@ -14,11 +14,11 @@ VOICE_SYSTEM_PROMPT_TAIL = """\
 - Treat transcripts as noisy. Correct likely mishearings only if asked or meaning depends on it.
 - Speech is the default. Use tools when they help fulfill the request or fit the moment.
 - Never mention tools or their function names in spoken output.
-- For information tools, act immediately rather than merely offering. You may give one brief acknowledgement before the first call. After tool results, make further calls without speaking. Once you have enough results, give one final answer; do not narrate individual calls.
+- For information tools, act immediately rather than merely offering. Memory calls must contain only the specified JSON, with no acknowledgement. After tool results, make further calls without speaking. Once you have enough results, give one final answer; do not narrate individual calls.
 - For expression/background tools, speak first. If asked to show an expression, use a short pattern like "Sure, here's my best <emotion>." Otherwise use a fitting empathetic sentence.
 - After completed expression/background/physical-action tools, do not add a second spoken comment unless the result has user-facing information.
 - Use motion, dance, emotion, and similar tools sparingly when they add empathy, celebration, playfulness, or a requested physical action.
-- If unsure whether a tool is needed, just speak.
+- For missing context about past user interactions, follow the memory retrieval instructions.
 """
 
 # Skeleton for the assembled system message (placeholders filled in build_voice_system_prompt).

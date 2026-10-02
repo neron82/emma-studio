@@ -350,11 +350,11 @@ def test_concurrent_turns_are_serialized_and_chats_remain_isolated(env, monkeypa
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed(persona, history, text, facts, *, session_id):
+    async def delayed(persona, history, text, facts, *, session_id, store):
         if text == "First":
             entered.set()
             await release.wait()
-        return await original(persona, history, text, facts, session_id=session_id)
+        return await original(persona, history, text, facts, session_id=session_id, store=store)
 
     monkeypatch.setattr(transport.dialog, "chat", delayed)
     async def scenario():
@@ -701,3 +701,34 @@ def test_web_persona_edit_during_callback_discovery_preserves_session_selection(
         assert completions(env) == []
 
     asyncio.run(scenario())
+
+
+def test_new_session_memory_search_is_private_and_shared(env, monkeypatch):
+    previous = env.bot._session(42)
+    env.store.add_message(env.p['id'], 'user', 'Remember my dog Juniper.', session_id=previous['id'])
+    asyncio.run(env.bot.cmd_new(update(), context()))
+    assert env.store.get_session(previous['id'])['state'] == 'finalized'
+    assert env.store.search_memory(env.p['id'], 'Juniper', session_id=previous['memory_id'])
+    responses = iter([
+        'Let me look. {"tool":"memory_search","arguments":{"query":"Juniper"}}',
+        'Your dog is named Juniper.',
+    ])
+    # The env fixture already wraps AsyncClient. Use a dedicated mock for this turn.
+    def reply(request):
+        body = json.loads(request.content)
+        if len(body['messages']) > 2:
+            assert any('Juniper' in m['content'] for m in body['messages'] if m['content'].startswith('<memory_tool_result>'))
+        return httpx.Response(200, json={'choices': [{'message': {'content': next(responses)}}]})
+    # Recover the actual class since the fixture replaces the module attribute.
+    from httpx._client import AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: AsyncClient(transport=httpx.MockTransport(reply), **kwargs))
+    delivered = []
+    async def capture_voice(update, response, persona):
+        delivered.append(response)
+    env.bot._voice_reply = capture_voice
+    message = update('What is my dog called?')
+    asyncio.run(env.bot.on_text(message, context()))
+    assert message.message.replies == []
+    assert delivered == ['Your dog is named Juniper.']
+    transcript = env.store.session_transcript(env.bot._session(42)['id'])
+    assert [m['content'] for m in transcript] == ['What is my dog called?', 'Your dog is named Juniper.']

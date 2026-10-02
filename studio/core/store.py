@@ -1,17 +1,15 @@
 """SQLite schema + store for Emma Studio.
 
-Three tables, no more:
-  personas   — appearance/voice/personality references
-  jobs       — the central state machine object (script -> speech -> render)
-  facts      — RAG fact cards (FTS5-indexed)
-
-Design rules:
-  - Every job step is persisted and individually re-triggerable.
-  - Facts are curated cards, not session dumps.
+Personas, jobs, curated facts, and persistent session transcripts/summaries.
+Facts and session memory have independent FTS5 indexes. Source tables retain
+full text; retrieval returns bounded excerpts or exact paginated transcript text.
 """
 from __future__ import annotations
 
+import re
+import secrets
 import sqlite3
+import string
 import time
 import uuid
 from pathlib import Path
@@ -189,7 +187,95 @@ class Store:
             self.conn.execute("ALTER TABLE messages ADD COLUMN session_id TEXT REFERENCES sessions(id)")
         # erst nach der Spalte: auf alten DBs fehlt sie sonst noch (Startup-Crash)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)")
+        self._migrate_memory()
         self.conn.commit()
+
+    def _new_memory_id(self) -> str:
+        while True:
+            candidate = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+            if not self.conn.execute("SELECT 1 FROM sessions WHERE memory_id=?", (candidate,)).fetchone():
+                return candidate
+
+    def _migrate_memory(self) -> None:
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "memory_id" not in cols:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN memory_id TEXT")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_memory_id ON sessions(memory_id)")
+        for row in self.conn.execute("SELECT id FROM sessions WHERE memory_id IS NULL").fetchall():
+            self.conn.execute("UPDATE sessions SET memory_id=? WHERE id=?", (self._new_memory_id(), row["id"]))
+        # External-content indexes preserve every original character in the source tables.
+        # Triggers also index late-arriving transcript messages and summary replacements.
+        for table, column in (("messages", "content"), ("sessions", "summary")):
+            index = f"memory_{table}_fts"
+            exists = self.conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (index,)).fetchone()
+            self.conn.executescript(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {index} USING fts5(
+                    {column}, content='{table}', content_rowid='rowid', tokenize='unicode61');
+                CREATE TRIGGER IF NOT EXISTS {index}_ai AFTER INSERT ON {table} BEGIN
+                    INSERT INTO {index}(rowid, {column}) VALUES (new.rowid, new.{column});
+                END;
+                CREATE TRIGGER IF NOT EXISTS {index}_ad AFTER DELETE ON {table} BEGIN
+                    INSERT INTO {index}({index}, rowid, {column}) VALUES ('delete', old.rowid, old.{column});
+                END;
+                CREATE TRIGGER IF NOT EXISTS {index}_au AFTER UPDATE OF {column} ON {table} BEGIN
+                    INSERT INTO {index}({index}, rowid, {column}) VALUES ('delete', old.rowid, old.{column});
+                    INSERT INTO {index}(rowid, {column}) VALUES (new.rowid, new.{column});
+                END;
+            """)
+            if not exists:
+                self.conn.execute(f"INSERT INTO {index}({index}) VALUES ('rebuild')")
+
+    def search_memory(self, persona_id: str, query: str, *, session_id: str | None = None,
+                      limit: int = 5) -> list[dict]:
+        """Safe natural-language keyword search, ranked by BM25; scoped to this persona."""
+        tokens = re.findall(r"[^\W_]+", query[:1000], re.UNICODE)[:32]
+        if not tokens:
+            return []
+        match = " OR ".join('"' + token + '"' for token in tokens)
+        scope = " AND (s.memory_id=? COLLATE NOCASE OR s.id=?)" if session_id else ""
+        params = (match, persona_id, session_id, session_id) if session_id else (match, persona_id)
+        limit = max(1, min(int(limit), 10))
+        results = []
+        for table, join, kind, role in (
+            ("messages", "JOIN messages m ON m.rowid=f.rowid JOIN sessions s ON s.id=m.session_id", "transcript", "m.role"),
+            ("sessions", "JOIN sessions s ON s.rowid=f.rowid", "summary", "'summary'"),
+        ):
+            index = f"memory_{table}_fts"
+            rows = self.conn.execute(
+                f"SELECT s.memory_id AS session_id, s.transport, s.started_at, {role} AS role,"
+                f" snippet({index}, 0, '', '', ' … ', 64) AS text, bm25({index}) AS score"
+                f" FROM {index} f {join} WHERE {index} MATCH ? AND s.persona_id=?"
+                + scope + " ORDER BY score LIMIT ?", (*params, limit)).fetchall()
+            results.extend(dict(r, kind=kind, text=r['text'][:2000]) for r in rows)
+        return sorted(results, key=lambda r: r['score'])[:limit]
+
+    def read_memory_session(self, persona_id: str, session_id: str, *, offset: int = 0,
+                            limit: int = 8) -> dict:
+        """Read exact transcript text in bounded character pages, never another persona's data."""
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE persona_id=? AND (memory_id=? COLLATE NOCASE OR id=?)",
+            (persona_id, session_id, session_id)).fetchone()
+        if row is None:
+            return {"error": "Unknown session ID"}
+        transcript = '\n\n'.join(f"{m['role']}: {m['content']}" for m in self.session_transcript(row['id']))
+        offset = max(0, int(offset))
+        size = max(1, min(int(limit), 10)) * 1000
+        return {"session_id": row['memory_id'], "summary": (row['summary'] or '')[:4000],
+                "text": transcript[offset:offset + size], "offset": offset,
+                "next_offset": offset + size if offset + size < len(transcript) else None}
+
+    def memory_summaries(self, persona_id: str) -> str:
+        rows = self.conn.execute(
+            "SELECT memory_id, started_at, summary FROM sessions WHERE persona_id=?"
+            " AND summary IS NOT NULL AND summary<>'' ORDER BY started_at DESC", (persona_id,)).fetchall()
+        entries, words = [], 0
+        for row in rows:
+            entry = f"## Session {row['memory_id']} — {time.strftime('%Y-%m-%d %H:%M', time.localtime(row['started_at']))}\n{row['summary']}"
+            if entries and words + len(entry.split()) > config.MEMORY_MAX_WORDS:
+                break
+            entries.append(entry)
+            words += len(entry.split())
+        return '\n\n'.join(reversed(entries))
 
     def close(self) -> None:
         self.conn.close()
@@ -424,16 +510,17 @@ class Store:
                        model_override: bool = False) -> dict:
         """Persist a model snapshot; only an explicit override pins Telegram routing."""
         sid = _uid()
+        memory_id = self._new_memory_id()
         now = _now()
         selection = model_settings if model_settings is not None else self.get_persona(persona_id)
         selection = selection or {}
         self.conn.execute(
             "INSERT INTO sessions (id, persona_id, state, started_at, transport, transport_key,"
-            " llm_provider, llm_base_url, llm_model, llm_override)"
-            " VALUES (?,?, 'active', ?,?,?,?,?,?,?)",
+            " llm_provider, llm_base_url, llm_model, llm_override, memory_id)"
+            " VALUES (?,?, 'active', ?,?,?,?,?,?,?,?)",
             (sid, persona_id, now, transport, transport_key,
              selection.get("llm_provider", ""), selection.get("llm_base_url", ""),
-             selection.get("llm_model", ""), 1 if model_override else 0),
+             selection.get("llm_model", ""), 1 if model_override else 0, memory_id),
         )
         self.conn.commit()
         return self.get_session(sid)
