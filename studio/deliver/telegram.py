@@ -6,6 +6,7 @@ with its predecessor: Telegram permits only one getUpdates consumer per token.
 from __future__ import annotations
 
 import asyncio
+import base64
 from functools import wraps
 import ipaddress
 import logging
@@ -29,6 +30,17 @@ from .telegram_config import BotSettings, load_settings
 
 
 logger = logging.getLogger(__name__)
+
+# Image mime types by file suffix for the data: URL sent to the vision model.
+# Telegram photos are JPEG; documents carry their own mime_type and take priority.
+IMAGE_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".bmp": "image/bmp", ".gif": "image/gif", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".avif": "image/avif",
+}
+# Stored as the user turn's text when a photo carries no caption (keeps the
+# transcript and fact search non-empty and readable).
+IMAGE_TURN_PLACEHOLDER = "[Bild]"
 
 
 class VoiceReplyError(RuntimeError):
@@ -379,7 +391,7 @@ class TelegramTransport:
     @serialized
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         session = self._session(update.effective_chat.id)
-        await self._reply(update, "Emma Studio. Text or a voice note → complete voice reply.\n/new — summarize and start fresh\n/persona [name or ID] — list/switch personas\n/provider — choose a provider\n/model — choose a model\n/fact <text> — remember a fact\n/video <topic> — render a video\n\n" + self._label(session))
+        await self._reply(update, "Emma Studio. Text, a voice note or a photo → complete voice reply.\n/new — summarize and start fresh\n/persona [name or ID] — list/switch personas\n/provider — choose a provider\n/model — choose a model\n/fact <text> — remember a fact\n/video <topic> — render a video\n\n" + self._label(session))
 
     @serialized
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -443,7 +455,7 @@ class TelegramTransport:
         self.store.add_fact(fact, persona_id=session["persona_id"])
         await self._reply(update, "Fact saved.")
 
-    async def _turn(self, update, text: str):
+    async def _turn(self, update, text: str, image_data_url: str | None = None):
         session = self._session(update.effective_chat.id)
         persona = self._effective_persona(session)
         if persona["llm_provider"] == "opencode-go" and not persona["llm_model"]:
@@ -453,10 +465,14 @@ class TelegramTransport:
         except ModelConfigurationError:
             raise TransportError("The selected model/provider is not configured. Check server credentials and use /provider or /model before continuing.") from None
         history = [{"role": m["role"], "content": m["content"]} for m in self.store.session_transcript(session["id"])]
-        facts = await asyncio.to_thread(self.store.search_facts, text, persona_id=persona["id"])
-        self.store.add_message(persona["id"], "user", text, session_id=session["id"])
+        # A photo without a caption still needs a non-empty stored turn; the image
+        # itself only rides on the current request (history stays text-only).
+        stored = text or (IMAGE_TURN_PLACEHOLDER if image_data_url else text)
+        facts = await asyncio.to_thread(self.store.search_facts, stored, persona_id=persona["id"])
+        self.store.add_message(persona["id"], "user", stored, session_id=session["id"])
         try:
-            response = await dialog.chat(persona, history, text, facts, session_id=session["id"], store=self.store)
+            response = await dialog.chat(persona, history, text, facts, session_id=session["id"],
+                                         store=self.store, image_data_url=image_data_url)
             if not isinstance(response, str) or not response.strip():
                 raise ValueError("empty reply")
         except Exception as exc:
@@ -559,6 +575,56 @@ class TelegramTransport:
             raise TransportError("No speech understood; please try again or send text.")
         await self._turn(update, text)
 
+    async def _image_data_url(self, ctx, file_id: str, *, mime_hint: str | None = None,
+                              name_hint: str | None = None) -> str:
+        """Download a Telegram file and return it as an OpenAI ``data:`` URL.
+
+        Telegram photos have no explicit mime type; their server-side path ends in
+        ``.jpg``. Documents carry ``mime_type``/``file_name``. The vision server
+        converts anything that is not JPEG/PNG itself.
+        """
+        tg_file = await ctx.bot.get_file(file_id)
+        suffix = Path(getattr(tg_file, "file_path", "") or name_hint or "").suffix.lower()
+        mime = (mime_hint if (mime_hint or "").startswith("image/") else None) \
+            or IMAGE_MIME_BY_SUFFIX.get(suffix) or "image/jpeg"
+        data = await tg_file.download_as_bytearray()
+        if not data:
+            raise TransportError("The image could not be downloaded; please send it again.")
+        return f"data:{mime};base64,{base64.b64encode(bytes(data)).decode('ascii')}"
+
+    @serialized
+    async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        # Telegram sends several sizes; the last entry is the largest.
+        if message is None or not message.photo:
+            return
+        photo = message.photo[-1]
+        try:
+            data_url = await self._image_data_url(ctx, photo.file_id)
+        except TransportError:
+            raise
+        except Exception:
+            raise TransportError("The image could not be downloaded; please send it again.") from None
+        await self._turn(update, (message.caption or "").strip(), image_data_url=data_url)
+
+    @serialized
+    async def on_document(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        if message is None:
+            return
+        document = message.document
+        # Only images sent "as file"; everything else (PDF, archives, ...) is left alone.
+        if document is None or not (document.mime_type or "").startswith("image/"):
+            return
+        try:
+            data_url = await self._image_data_url(ctx, document.file_id, mime_hint=document.mime_type,
+                                                  name_hint=document.file_name)
+        except TransportError:
+            raise
+        except Exception:
+            raise TransportError("The image could not be downloaded; please send it again.") from None
+        await self._turn(update, (message.caption or "").strip(), image_data_url=data_url)
+
     @serialized
     async def cmd_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # The legacy render path remains optional, never imported for dialog/voice.
@@ -588,6 +654,8 @@ class TelegramTransport:
             app.add_handler(CommandHandler(command, getattr(self, f"cmd_{command}")))
         app.add_handler(CallbackQueryHandler(self.on_selection))
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
+        app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
+        app.add_handler(MessageHandler(filters.Document.IMAGE, self.on_document))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         app.add_error_handler(self._error)
         return app

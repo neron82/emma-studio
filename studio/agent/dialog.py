@@ -69,16 +69,36 @@ def build_system_prompt(persona: dict, facts: list[dict], search_results: list[d
     return "\n\n".join(parts)
 
 
+def _user_content(text: str, image_data_url: str | None):
+    """OpenAI-compatible user content: plain text, or text + one image part.
+
+    The vision model's server accepts ``{"type": "image_url", ...}`` with a
+    ``data:`` URL (see strata ``serve/frontend.py``: JPEG/PNG pass straight in).
+    """
+    if not image_data_url:
+        return text
+    parts = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    parts.append({"type": "image_url", "image_url": {"url": image_data_url}})
+    return parts
+
+
 async def chat(persona: dict, history: list[dict], user_message: str,
                facts: list[dict], search_results: list[dict] | None = None,
-               *, session_id: str | None = None, store=None) -> str:
-    """One user turn with private retrieval. History excludes the system prompt."""
+               *, session_id: str | None = None, store=None,
+               image_data_url: str | None = None) -> str:
+    """One user turn with private retrieval. History excludes the system prompt.
+
+    ``image_data_url`` (optional) attaches one image to the current user turn as
+    a ``data:`` URL; the vision-capable model then sees it. History stays text-only.
+    """
     endpoint = resolve_endpoint(persona)
     session_id = session_id or f"{_DIALOG_SESSION_ID}:{persona.get('id', 'default')}"
-    messages = [{"role": "system", "content": build_system_prompt(persona, facts, search_results, store=store)}]
+    messages: list[dict] = [{"role": "system", "content": build_system_prompt(persona, facts, search_results, store=store)}]
     messages += history[-12:]  # keep context bounded
-    messages.append({"role": "user", "content": user_message})
-    async with httpx.AsyncClient(timeout=120) as client:
+    messages.append({"role": "user", "content": _user_content(user_message, image_data_url)})
+    async with httpx.AsyncClient(timeout=300) as client:
         for count in range(MAX_MEMORY_CALLS + 1):
             resp = await client.post(
                 f"{endpoint.base_url.rstrip('/')}/chat/completions",

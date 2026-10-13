@@ -24,6 +24,9 @@ class Message:
     def __init__(self, text="hello"):
         self.text = text
         self.voice = None
+        self.photo = None
+        self.caption = None
+        self.document = None
         self.replies = []
         self.markups = []
         self.voices = []
@@ -359,11 +362,12 @@ def test_concurrent_turns_are_serialized_and_chats_remain_isolated(env, monkeypa
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed(persona, history, text, facts, *, session_id, store):
+    async def delayed(persona, history, text, facts, *, session_id, store, image_data_url=None):
         if text == "First":
             entered.set()
             await release.wait()
-        return await original(persona, history, text, facts, session_id=session_id, store=store)
+        return await original(persona, history, text, facts, session_id=session_id, store=store,
+                              image_data_url=image_data_url)
 
     monkeypatch.setattr(transport.dialog, "chat", delayed)
     async def scenario():
@@ -740,3 +744,116 @@ def test_new_session_memory_search_is_private_and_shared(env, monkeypatch):
     assert delivered == ['Your dog is named Juniper.']
     transcript = env.store.session_transcript(env.bot._session(42)['id'])
     assert [m['content'] for m in transcript] == ['What is my dog called?', 'Your dog is named Juniper.']
+
+
+# --- photos / images sent to the vision model ---------------------------------
+
+class PhotoSize:
+    def __init__(self, file_id):
+        self.file_id = file_id
+
+
+class Document:
+    def __init__(self, file_id, mime_type, file_name="file"):
+        self.file_id = file_id
+        self.mime_type = mime_type
+        self.file_name = file_name
+
+
+class TgFile:
+    def __init__(self, data, path="photos/file_1.jpg"):
+        self.file_path = path
+        self._data = data
+
+    async def download_as_bytearray(self):
+        return bytearray(self._data)
+
+
+class Bot:
+    def __init__(self, file):
+        self._file = file
+        self.requested = []
+
+    async def get_file(self, file_id):
+        self.requested.append(file_id)
+        return self._file
+
+
+def image_context(bot, *args):
+    return SimpleNamespace(args=list(args), bot=bot)
+
+
+def photo_message(caption=None, file_ids=("small", "large")):
+    message = update(caption or "")
+    message.message.photo = [PhotoSize(fid) for fid in file_ids]
+    message.message.caption = caption
+    return message
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"jpeg-body-bytes" * 4
+
+
+def test_photo_is_downloaded_and_sent_as_an_image_part(env):
+    async def scenario():
+        bot = Bot(TgFile(JPEG, "photos/file_9.jpg"))
+        message = photo_message("Was ist das?")
+        await env.bot.on_photo(message, image_context(bot))
+        # The largest size is the one downloaded.
+        assert bot.requested == ["large"]
+        request, payload = completions(env)[-1]
+        content = payload["messages"][-1]["content"]
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "Was ist das?"}
+        image = [p for p in content if p["type"] == "image_url"]
+        assert len(image) == 1
+        url = image[0]["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+    asyncio.run(scenario())
+
+
+def test_photo_without_caption_stores_a_readable_placeholder(env):
+    async def scenario():
+        bot = Bot(TgFile(JPEG))
+        message = photo_message(None)
+        await env.bot.on_photo(message, image_context(bot))
+        request, payload = completions(env)[-1]
+        # No text part when there is no caption; the image still rides along.
+        content = payload["messages"][-1]["content"]
+        assert [p["type"] for p in content] == ["image_url"]
+        transcript = env.store.session_transcript(env.bot._session(42)["id"])
+        assert transcript[0]["content"] == "[Bild]"
+    asyncio.run(scenario())
+
+
+def test_image_document_is_accepted_and_non_image_ignored(env):
+    async def scenario():
+        bot = Bot(TgFile(JPEG, "documents/pic.png"))
+        doc = Document("doc-1", "image/png", "pic.png")
+        message = update("")
+        message.message.document = doc
+        message.message.caption = "Ein PNG"
+        await env.bot.on_document(message, image_context(bot))
+        request, payload = completions(env)[-1]
+        url = payload["messages"][-1]["content"][-1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        # A non-image document is left alone (no request, no reply).
+        before = len(completions(env))
+        ignored = update("")
+        ignored.message.document = Document("doc-2", "application/pdf", "report.pdf")
+        await env.bot.on_document(ignored, image_context(bot))
+        assert len(completions(env)) == before
+        assert ignored.message.replies == []
+    asyncio.run(scenario())
+
+
+def test_photo_download_failure_reports_and_replies(env):
+    async def scenario():
+        class FailingBot:
+            async def get_file(self, file_id):
+                raise RuntimeError("secret-token in https://api.telegram.org/botsecret-token/getFile")
+        message = photo_message("Bild")
+        await env.bot.on_photo(message, image_context(FailingBot()))
+        assert "could not be downloaded" in message.message.replies[-1]
+        assert "secret-token" not in message.message.replies[-1]
+        assert completions(env) == []
+    asyncio.run(scenario())
