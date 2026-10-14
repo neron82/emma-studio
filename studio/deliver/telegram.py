@@ -71,7 +71,7 @@ def serialized(handler):
             except TransportError as exc:
                 await self._reply(update, str(exc))
             except (ModelConfigurationError, ModelDiscoveryError):
-                await self._reply(update, "Model selection failed. Check the provider configuration/credentials and try /provider or /model again. Your selection is unchanged.")
+                await self._reply(update, "Model selection failed. Check the provider configuration/credentials and try /model again. Your selection is unchanged.")
             except Exception:
                 # Upstream exceptions can contain bot tokens, HTTP URLs, or response
                 # bodies. Never echo them, or log them with traceback/transcript.
@@ -193,7 +193,7 @@ class TelegramTransport:
         current = self.store.get_transport_session("telegram", self._key(chat_id))
         if current is None or self._view_key(current) != key:
             self._menus.pop(chat_id, None)
-            raise TransportError("This menu is out of date. Open /provider or /model again; selection unchanged.")
+            raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
         return current
 
     async def _menu(self, update, session: dict, kind: str, rows: list,
@@ -213,7 +213,15 @@ class TelegramTransport:
             return InlineKeyboardButton(label, callback_data=f"select:{token}:{index}")
 
         selected = self._selection(self._effective_persona(session))
-        if kind == "provider":
+        if kind == "persona":
+            for row in rows:
+                label = row["name"]
+                if row["id"] == session["persona_id"]:
+                    label = "✓ " + label
+                keyboard.append([button(label, "persona", row["id"])])
+            keyboard.append([button("Cancel", "cancel", "")])
+            heading = "Choose a persona:"
+        elif kind == "provider":
             inherited = self._selection(self.store.get_persona(session["persona_id"]))
             model = self._model_label(inherited)
             label = f"Use persona settings ({self._provider_label(inherited)} / {model})"
@@ -228,6 +236,7 @@ class TelegramTransport:
                 if session.get("llm_override") and provider == selected["llm_provider"]:
                     label = "✓ " + label
                 keyboard.append([button(label, "provider", provider)])
+            keyboard.append([button("Cancel", "cancel", "")])
             heading = "Choose a provider:"
         else:
             size = 8
@@ -251,6 +260,7 @@ class TelegramTransport:
                 navigation.append(button("Next ›", "page", page + 1))
             if navigation:
                 keyboard.append(navigation)
+            keyboard.append([button("‹ Providers", "back", ""), button("Cancel", "cancel", "")])
             heading = f"Choose a model (page {page + 1}/{pages}):" if rows else "No models advertised by this provider."
         record = {"token": token, "key": key, "kind": kind,
                   "choices": choices, "rows": rows, "discovered": discovered}
@@ -281,7 +291,7 @@ class TelegramTransport:
         )
         if session is None:
             self._menus.pop(update.effective_chat.id, None)
-            raise TransportError("The persona settings changed. Open /provider again; selection unchanged.")
+            raise TransportError("The persona settings changed. Open /model again; selection unchanged.")
         self._menus.pop(update.effective_chat.id, None)
         await self._menu(update, session, "model", discovered["models"], discovered=discovered)
 
@@ -299,7 +309,7 @@ class TelegramTransport:
         )
         if session is None:
             self._menus.pop(update.effective_chat.id, None)
-            raise TransportError("The persona settings changed. Open /provider again; selection unchanged.")
+            raise TransportError("The persona settings changed. Open /model again; selection unchanged.")
         self._menus.pop(update.effective_chat.id, None)
         await self._menu(update, session, "model", discovered["models"], discovered=discovered)
 
@@ -310,7 +320,7 @@ class TelegramTransport:
         selected = self._selection(self._effective_persona(session))
         discovered = await discover_models(selected["llm_provider"], selected["llm_base_url"])
         if expected_base is not None and discovered["base_url"] != expected_base:
-            raise TransportError("This menu is out of date. Open /provider or /model again; selection unchanged.")
+            raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
         if expected_models is not None and discovered["models"] != expected_models:
             raise TransportError("The provider's model list changed. Open /model again; selection unchanged.")
         if default and selected["llm_provider"] == "configured":
@@ -334,6 +344,40 @@ class TelegramTransport:
         else:
             await self._reply(update, self._label(session))
 
+    async def _activate_persona(self, update, session: dict, persona: dict) -> dict:
+        """Move this chat onto `persona`, keeping exactly one active session.
+
+        A switch away from a session that holds real messages closes (and
+        summarizes) it and opens a fresh one, so every character change starts a
+        new conversation. A switch away from an EMPTY session instead re-points
+        that same row: flipping through personas therefore no longer leaves a
+        trail of empty sessions and empty summaries behind.
+        """
+        chat_id = update.effective_chat.id
+        self._menus.pop(chat_id, None)
+        if persona["id"] == session["persona_id"]:
+            return session
+        if not self.store.session_transcript(session["id"], limit=1):
+            retargeted = self.store.retarget_session_persona(
+                session["id"], persona["id"], model_settings=self._selection(persona))
+            if retargeted is not None:
+                return retargeted
+        await self._close(session)
+        return self._create(chat_id, persona)
+
+    async def _choose_persona(self, update, session: dict, persona_id: str):
+        persona = self.store.get_persona(persona_id)
+        if not persona:
+            raise TransportError("That persona no longer exists. Open /persona again.")
+        # Validate the menu BEFORE switching: the switch changes the view key.
+        self._ensure_view(update, self._view_key(session))
+        session = await self._activate_persona(update, session, persona)
+        query = getattr(update, "callback_query", None)
+        if query:
+            await query.edit_message_text(text=self._label(session), reply_markup=None)
+        else:
+            await self._reply(update, self._label(session))
+
     @serialized
     async def on_selection(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -341,13 +385,20 @@ class TelegramTransport:
         parts = (query.data or "").split(":")
         if (not record or len(parts) != 3 or parts[0] != "select"
                 or parts[1] != record["token"] or parts[2] not in record["choices"]):
-            raise TransportError("This menu is out of date. Open /provider or /model again; selection unchanged.")
+            raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
         session = self._session(update.effective_chat.id)
         if record["key"] != self._view_key(session):
             self._menus.pop(update.effective_chat.id, None)
-            raise TransportError("This menu is out of date. Open /provider or /model again; selection unchanged.")
+            raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
         action, value = record["choices"][parts[2]]
-        if action == "provider":
+        if action == "cancel":
+            self._menus.pop(update.effective_chat.id, None)
+            await query.edit_message_text(text="Cancelled. Selection unchanged.", reply_markup=None)
+        elif action == "persona":
+            await self._choose_persona(update, session, value)
+        elif action == "back":
+            await self._menu(update, session, "provider", [], view_key=record["key"])
+        elif action == "provider":
             await self._choose_provider(update, session, value)
         elif action == "inherit":
             await self._inherit_provider(update, session)
@@ -391,7 +442,7 @@ class TelegramTransport:
     @serialized
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         session = self._session(update.effective_chat.id)
-        await self._reply(update, "Emma Studio. Text, a voice note or a photo → complete voice reply.\n/new — summarize and start fresh\n/persona [name or ID] — list/switch personas\n/provider — choose a provider\n/model — choose a model\n/fact <text> — remember a fact\n/video <topic> — render a video\n\n" + self._label(session))
+        await self._reply(update, "Emma Studio. Text, a voice note or a photo → complete voice reply.\n/new — summarize and start fresh\n/persona — pick a persona from a list\n/model — pick a provider, then its model\n/fact <text> — remember a fact\n/video <topic> — render a video\n\n" + self._label(session))
 
     @serialized
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -409,28 +460,15 @@ class TelegramTransport:
         choice = " ".join(ctx.args or []).strip()
         personas = self.store.list_personas()
         if not choice:
-            lines = [f"{'Active: ' if p['id'] == session['persona_id'] else ''}{p['name']} — {p['id']}" for p in personas]
-            await self._reply(update, "Personas (/persona <name or ID>):\n" + "\n".join(lines))
+            # A clickable list, so the names never have to be remembered.
+            rows = [{"id": p["id"], "name": p["name"]} for p in personas]
+            await self._menu(update, session, "persona", rows)
             return
         matches = [p for p in personas if p["id"] == choice or p["name"].casefold() == choice.casefold()]
         if len(matches) != 1:
-            raise TransportError("Persona not found or name ambiguous. Use /persona to list exact IDs.")
-        persona = matches[0]
-        if persona["id"] != session["persona_id"]:
-            await self._close(session)
-            session = self._create(update.effective_chat.id, persona)
+            raise TransportError("Persona not found or name ambiguous. Use /persona to pick from the list.")
+        session = await self._activate_persona(update, session, matches[0])
         await self._reply(update, self._label(session))
-
-    @serialized
-    async def cmd_provider(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        session = self._session(update.effective_chat.id)
-        provider = " ".join(ctx.args or []).strip()
-        if not provider:
-            await self._menu(update, session, "provider", [])
-            return
-        if provider not in {"configured", "opencode-go"}:
-            raise TransportError("Unknown provider. Use /provider to choose from the list.")
-        await self._choose_provider(update, session, provider)
 
     @serialized
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -438,10 +476,9 @@ class TelegramTransport:
         selected = self._selection(self._effective_persona(session))
         choice = " ".join(ctx.args or []).strip()
         if not choice:
-            key = self._view_key(session)
-            discovered = await discover_models(selected["llm_provider"], selected["llm_base_url"])
-            await self._menu(update, session, "model", discovered["models"], discovered=discovered,
-                             view_key=key)
+            # One entry point for provider AND model: choose the provider first
+            # (or cancel), then pick from its freshly polled v1/models list.
+            await self._menu(update, session, "provider", [])
             return
         await self._choose_model(update, session, choice,
                                  default=choice == "default" and selected["llm_provider"] == "configured")
@@ -463,7 +500,7 @@ class TelegramTransport:
         try:
             validate_selection(self._selection(persona))
         except ModelConfigurationError:
-            raise TransportError("The selected model/provider is not configured. Check server credentials and use /provider or /model before continuing.") from None
+            raise TransportError("The selected model/provider is not configured. Check server credentials and use /model before continuing.") from None
         history = [{"role": m["role"], "content": m["content"]} for m in self.store.session_transcript(session["id"])]
         # A photo without a caption still needs a non-empty stored turn; the image
         # itself only rides on the current request (history stays text-only).
@@ -493,7 +530,7 @@ class TelegramTransport:
                     reason += "Check that this model is available and supports chat requests."
             else:
                 reason = "The provider could not complete a valid reply. Check its model/service configuration."
-            raise TransportError(f"{reason}\nProvider: {self._provider_label(selected)}\nModel: {endpoint.model}\nYour message is saved. Use /provider or /model to change the session selection, then try again.") from None
+            raise TransportError(f"{reason}\nProvider: {self._provider_label(selected)}\nModel: {endpoint.model}\nYour message is saved. Use /model to change the session selection, then try again.") from None
         self.store.add_message(persona["id"], "assistant", response, session_id=session["id"])
         try:
             await self._voice_reply(update, response, persona)
@@ -650,7 +687,7 @@ class TelegramTransport:
         for name in ("httpx", "httpcore", "telegram"):
             logging.getLogger(name).setLevel(logging.CRITICAL)
         app = Application.builder().token(self.settings.token).concurrent_updates(False).build()
-        for command in ("start", "new", "persona", "provider", "model", "fact", "video"):
+        for command in ("start", "new", "persona", "model", "fact", "video"):
             app.add_handler(CommandHandler(command, getattr(self, f"cmd_{command}")))
         app.add_handler(CallbackQueryHandler(self.on_selection))
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))

@@ -561,6 +561,31 @@ class Store:
             return None
         return self.get_session(session_id)
 
+    def retarget_session_persona(self, session_id: str, persona_id: str, *,
+                                 model_settings: dict | None = None) -> dict | None:
+        """Re-point an ACTIVE session at another persona, in place.
+
+        Used when a persona switch happens on a session that holds no messages:
+        the row is reused instead of finalized and replaced, so flipping through
+        personas does not pile up empty sessions (and their summaries).
+        Returns None when the session is missing or no longer active.
+        """
+        row = self.get_session(session_id)
+        if row is None or row["state"] != "active":
+            return None
+        selection = model_settings if model_settings is not None else self.get_persona(persona_id)
+        selection = selection or {}
+        cur = self.conn.execute(
+            "UPDATE sessions SET persona_id=?, llm_provider=?, llm_base_url=?, llm_model=?,"
+            " llm_override=? WHERE id=? AND state='active'",
+            (persona_id, selection.get("llm_provider", ""), selection.get("llm_base_url", ""),
+             selection.get("llm_model", ""), 0, session_id),
+        )
+        self.conn.commit()
+        if cur.rowcount != 1:
+            return None
+        return self.get_session(session_id)
+
     def list_sessions(self, persona_id: str | None = None, limit: int = 50,
                       *, transport: str | None = None) -> list[dict]:
         filters: list[str] = []

@@ -83,6 +83,29 @@ def menu_button(message, contains):
     return buttons[0]
 
 
+def provider_button(message, contains):
+    """A provider row of the merged /model menu (never the inheritance row)."""
+    buttons = [button for row in message.markups[-1].inline_keyboard for button in row
+               if contains in button.text and "Use persona settings" not in button.text]
+    assert len(buttons) == 1, [b.text for row in message.markups[-1].inline_keyboard for b in row]
+    return buttons[0]
+
+
+async def open_model_menu(bot, message, provider=None):
+    """/model is one entry point now: provider list first, then that provider's models.
+
+    `provider=None` keeps the current selection ("Use persona settings"); otherwise the
+    named provider row is clicked. Either way the caller ends up on the model list.
+    """
+    await bot.cmd_model(message, context())
+    if provider is None:
+        button = menu_button(message.message, "Use persona settings")
+    else:
+        button = provider_button(message.message, provider)
+    await bot.on_selection(callback(message.message, button.callback_data), context())
+    return message
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
@@ -155,7 +178,7 @@ def test_new_summarizes_and_injects_memory_without_old_session_history(env):
         assert payload["messages"][1:] == [{"role": "user", "content": "What did we plan?"}]
         assert [m["content"] for m in env.store.session_transcript(new["id"])] == ["What did we plan?", "Completed reply."]
         # The persisted ID drives actual Go session headers after a provider switch.
-        await env.bot.cmd_provider(update(), context("opencode-go"))
+        await open_model_menu(env.bot, update(), "OpenCode Go")
         await env.bot.cmd_model(update(), context("chosen-model"))
         await env.bot.on_text(update("Next turn"), context())
         assert completions(env)[-1][0].headers["x-opencode-session"] == new["id"]
@@ -164,7 +187,7 @@ def test_new_summarizes_and_injects_memory_without_old_session_history(env):
 
 def test_provider_pending_model_selection_and_restart_are_session_scoped(env):
     async def scenario():
-        await env.bot.cmd_provider(update(), context("opencode-go"))
+        await open_model_menu(env.bot, update(), "OpenCode Go")
         sid = env.bot._session(42)["id"]
         pending = update("Not sent before model selection")
         await env.bot.on_text(pending, context())
@@ -188,7 +211,7 @@ def test_provider_pending_model_selection_and_restart_are_session_scoped(env):
         assert summaries[-1][1]["model"] == "chosen-model"
         assert summaries[-1][0].headers["x-opencode-session"] == sid
         assert restarted._session(42)["llm_model"] == "chosen-model"
-        await restarted.cmd_provider(update(), context("configured"))
+        await open_model_menu(restarted, update(), "configured.invalid")
         await restarted.cmd_model(update(), context("default"))
         await restarted.on_text(update("Configured again"), context())
         assert completions(env)[-1][1]["model"] == "configured-model"
@@ -280,13 +303,20 @@ def test_model_discovery_failure_and_unknown_id_preserve_selection(env):
         await env.bot.cmd_model(unknown, context("not-advertised"))
         assert env.bot._session(42)["llm_model"] == before["llm_model"]
         env.failures["models"] = True
-        for handler, args in [("cmd_provider", ("opencode-go",)), ("cmd_model", ("other-model",))]:
-            failed = update()
-            await getattr(env.bot, handler)(failed, context(*args))
-            after = env.bot._session(42)
-            assert (after["llm_provider"], after["llm_model"]) == (before["llm_provider"], before["llm_model"])
-            assert "unchanged" in failed.message.replies[-1]
-            assert "secret" not in " ".join(failed.message.replies)
+        # A failure while the provider list must poll for its models ...
+        failed = update()
+        await open_model_menu(env.bot, failed, "OpenCode Go")
+        after = env.bot._session(42)
+        assert (after["llm_provider"], after["llm_model"]) == (before["llm_provider"], before["llm_model"])
+        assert "unchanged" in failed.message.replies[-1]
+        assert "secret" not in " ".join(failed.message.replies)
+        # ... and a failure while a model id is picked directly.
+        failed = update()
+        await env.bot.cmd_model(failed, context("other-model"))
+        after = env.bot._session(42)
+        assert (after["llm_provider"], after["llm_model"]) == (before["llm_provider"], before["llm_model"])
+        assert "unchanged" in failed.message.replies[-1]
+        assert "secret" not in " ".join(failed.message.replies)
     asyncio.run(scenario())
 
 
@@ -295,7 +325,7 @@ def test_unauthorized_updates_are_silent_without_state_changes(env, chat_id, cha
     async def scenario():
         message = update(chat_id=chat_id, chat_type=chat_type)
         for handler, args in [("on_text", ()), ("cmd_start", ()), ("cmd_new", ()),
-                              ("cmd_persona", ("Other",)), ("cmd_provider", ("opencode-go",)),
+                              ("cmd_persona", ("Other",)),
                               ("cmd_model", ()), ("cmd_fact", ("private fact",)), ("on_voice", ())]:
             await getattr(env.bot, handler)(message, context(*args))
         assert message.message.replies == []
@@ -391,7 +421,7 @@ def test_model_picker_pages_long_utf8_ids_and_selects_discovered_model(env):
 
     async def scenario():
         listing = update()
-        await env.bot.cmd_model(listing, context())
+        await open_model_menu(env.bot, listing)
         message = listing.message
         first_choice = menu_button(message, "Name 00").callback_data
         assert not any("Name 18" in b.text for row in message.markups[-1].inline_keyboard for b in row)
@@ -454,7 +484,7 @@ def test_voice_input_uses_durable_turn_and_removes_download(env, monkeypatch, fa
 def test_tappable_provider_model_selection_persists_and_default_is_concrete(env):
     async def scenario():
         provider = update()
-        await env.bot.cmd_provider(provider, context())
+        await env.bot.cmd_model(provider, context())
         assert "Provider: configured.invalid" in provider.message.replies[-1]
         assert "Model: configured-model" in provider.message.replies[-1]
         go = callback(provider.message, menu_button(provider.message, "OpenCode Go").callback_data)
@@ -474,7 +504,7 @@ def test_tappable_provider_model_selection_persists_and_default_is_concrete(env)
         assert completions(env)[-1][1]["model"] == "chosen-model"
         assert env.store.get_persona(env.p["id"])["llm_provider"] == "configured"
 
-        await restarted.cmd_provider(provider, context())
+        await restarted.cmd_model(provider, context())
         # The inheritance row also names the same host; choose the endpoint row.
         configured_data = next(b.callback_data for row in provider.message.markups[-1].inline_keyboard
                                for b in row if b.text == "configured.invalid")
@@ -493,7 +523,7 @@ def test_tappable_provider_model_selection_persists_and_default_is_concrete(env)
 def test_stale_model_menu_cannot_change_current_session(env, change):
     async def scenario():
         listing = update()
-        await env.bot.cmd_model(listing, context())
+        await open_model_menu(env.bot, listing)
         old = menu_button(listing.message, "Chosen").callback_data
         if change == "replace":
             await env.bot.cmd_model(update(), context())
@@ -502,7 +532,7 @@ def test_stale_model_menu_cannot_change_current_session(env, change):
         elif change == "persona":
             await env.bot.cmd_persona(update(), context("Other"))
         elif change == "provider":
-            await env.bot.cmd_provider(update(), context("opencode-go"))
+            await open_model_menu(env.bot, update(), "OpenCode Go")
         else:
             env.store.update_persona(env.p["id"], llm_model="other-model")
         before = env.bot._session(42)
@@ -522,7 +552,7 @@ def test_stale_model_menu_cannot_change_current_session(env, change):
 def test_model_callbacks_reject_cross_chat_group_and_forged_actor(env, chat_id, chat_type, user_id):
     async def scenario():
         listing = update()
-        await env.bot.cmd_model(listing, context())
+        await open_model_menu(env.bot, listing)
         data = menu_button(listing.message, "Chosen").callback_data
         before = env.bot._session(42)
         request_count = len(env.requests)
@@ -538,7 +568,7 @@ def test_model_callbacks_reject_cross_chat_group_and_forged_actor(env, chat_id, 
 def test_model_callbacks_revalidate_discovery_and_preserve_selection_on_failure(env):
     async def scenario():
         listing = update()
-        await env.bot.cmd_model(listing, context())
+        await open_model_menu(env.bot, listing)
         data = menu_button(listing.message, "Chosen").callback_data
         before = env.bot._session(42)
         env.failures["models"] = True
@@ -549,7 +579,7 @@ def test_model_callbacks_revalidate_discovery_and_preserve_selection_on_failure(
         env.model_rows[:] = [{"id": "other-model"}]
         await env.bot.on_selection(callback(listing.message, data), context())
         assert env.bot._session(42) == before
-        await env.bot.cmd_model(listing, context())
+        await open_model_menu(env.bot, listing)
         valid = menu_button(listing.message, "other-model").callback_data
         forged = valid.rsplit(":", 1)[0] + ":999"
         await env.bot.on_selection(callback(listing.message, forged), context())
@@ -578,7 +608,7 @@ def test_inherited_effective_model_and_local_status_follow_persona_until_explici
         await env.bot.on_text(update("Preserve session override"), context())
         assert completions(env)[-1][1]["model"] == "other-model"
         picker = update()
-        await env.bot.cmd_provider(picker, context())
+        await env.bot.cmd_model(picker, context())
         inherited_choice = callback(picker.message, menu_button(picker.message, "Use persona settings").callback_data)
         await env.bot.on_selection(inherited_choice, context())
         assert not env.bot._session(42)["llm_override"]
@@ -631,7 +661,7 @@ def test_model_callback_waits_for_inflight_turn_before_changing_selection(env, m
 
     async def scenario():
         picker = update()
-        await env.bot.cmd_model(picker, context())
+        await open_model_menu(env.bot, picker)
         data = menu_button(picker.message, "Chosen").callback_data
         turn = asyncio.create_task(env.bot.on_text(update("Before selection"), context()))
         await entered.wait()
@@ -656,9 +686,9 @@ def test_provider_picker_recovers_from_missing_inherited_go_credentials(env, mon
 
     async def scenario():
         picker = update()
-        await env.bot.cmd_provider(picker, context())
+        await env.bot.cmd_model(picker, context())
         assert "OpenCode Go" in picker.message.replies[-1]
-        chosen = menu_button(picker.message, "configured.invalid")
+        chosen = provider_button(picker.message, "configured.invalid")
         await env.bot.on_selection(callback(picker.message, chosen.callback_data), context())
         await env.bot.on_selection(
             callback(picker.message, menu_button(picker.message, "Chosen").callback_data),
@@ -677,7 +707,7 @@ def test_web_persona_edit_during_callback_discovery_preserves_session_selection(
     async def scenario():
         picker = update()
         if action == "model":
-            await env.bot.cmd_model(picker, context())
+            await open_model_menu(env.bot, picker)
             chosen = menu_button(picker.message, "Chosen")
         else:
             if action == "inherit":
@@ -686,7 +716,7 @@ def test_web_persona_edit_during_callback_discovery_preserves_session_selection(
                     session["id"], llm_provider="opencode-go",
                     llm_base_url="", llm_model="chosen-model",
                 )
-            await env.bot.cmd_provider(picker, context())
+            await env.bot.cmd_model(picker, context())
             if action == "inherit":
                 chosen = menu_button(picker.message, "Use persona settings")
             else:
@@ -856,4 +886,113 @@ def test_photo_download_failure_reports_and_replies(env):
         assert "could not be downloaded" in message.message.replies[-1]
         assert "secret-token" not in message.message.replies[-1]
         assert completions(env) == []
+    asyncio.run(scenario())
+
+
+# --- persona menu, session-per-character, merged provider/model menu ----------
+
+def test_persona_command_opens_a_clickable_list_and_clicking_switches(env):
+    async def scenario():
+        listing = update()
+        await env.bot.cmd_persona(listing, context())
+        texts = [b.text for row in listing.message.markups[-1].inline_keyboard for b in row]
+        assert any("Emma" in t for t in texts) and "Other" in texts   # names, no memorizing
+        assert "✓ Emma" in texts                                      # the active one
+        assert "Cancel" in texts
+        await env.bot.on_selection(
+            callback(listing.message, menu_button(listing.message, "Other").callback_data), context())
+        assert env.bot._session(42)["persona_id"] == env.other["id"]
+        assert "Persona: Other" in listing.message.replies[-1]
+    asyncio.run(scenario())
+
+
+def test_persona_flip_on_an_empty_session_reuses_one_session(env):
+    """The core requirement: flipping characters with nothing said must not churn."""
+    async def scenario():
+        session = env.bot._session(42)
+        for target in (env.other["name"], env.p["name"], env.other["name"]):
+            await env.bot.cmd_persona(update(), context(target))
+        sessions = env.store.list_sessions(transport="telegram")
+        assert len(sessions) == 1                            # one row, re-pointed
+        assert sessions[0]["id"] == session["id"]
+        assert sessions[0]["state"] == "active"
+        assert sessions[0]["persona_id"] == env.other["id"]
+        assert sessions[0]["summary"] is None                # no empty summaries
+        assert env.store.session_transcript(session["id"]) == []
+        assert completions(env) == []                        # nothing was summarized
+    asyncio.run(scenario())
+
+
+def test_persona_switch_after_a_turn_opens_one_new_session_and_reuses_it(env):
+    async def scenario():
+        await env.bot.on_text(update("Garden plan"), context())
+        first = env.bot._session(42)
+        await env.bot.cmd_persona(update(), context(env.other["name"]))
+        second = env.bot._session(42)
+        assert second["id"] != first["id"]                   # a real switch starts fresh
+        assert second["persona_id"] == env.other["id"]
+        assert env.store.get_session(first["id"])["state"] == "finalized"
+        assert env.store.get_session(first["id"])["summary"] == env.summary
+        # The fresh session is empty, so the next flip reuses it instead of churning.
+        await env.bot.cmd_persona(update(), context(env.p["name"]))
+        assert env.bot._session(42)["id"] == second["id"]
+        assert len(env.store.list_sessions(transport="telegram")) == 2
+    asyncio.run(scenario())
+
+
+def test_model_command_starts_with_the_provider_list_then_polls_models(env):
+    async def scenario():
+        picker = update()
+        await env.bot.cmd_model(picker, context())
+        assert "Choose a provider:" in picker.message.replies[-1]
+        texts = [b.text for row in picker.message.markups[-1].inline_keyboard for b in row]
+        assert any("OpenCode Go" in t for t in texts)
+        assert "Cancel" in texts
+        assert not any("Chosen" in t for t in texts)         # models only after a provider
+        chosen = provider_button(picker.message, "OpenCode Go")
+        await env.bot.on_selection(callback(picker.message, chosen.callback_data), context())
+        assert "Choose a model" in picker.message.replies[-1]
+        models = [b.text for row in picker.message.markups[-1].inline_keyboard for b in row]
+        assert any("Chosen" in t for t in models)
+    asyncio.run(scenario())
+
+
+def test_model_menu_cancel_and_back_leave_the_selection_unchanged(env):
+    async def scenario():
+        picker = update()
+        await env.bot.cmd_model(picker, context())
+        before = env.bot._session(42)
+        await env.bot.on_selection(
+            callback(picker.message, menu_button(picker.message, "Cancel").callback_data), context())
+        assert env.bot._session(42) == before
+        assert "Cancelled" in picker.message.replies[-1]
+        assert completions(env) == []
+
+        # Provider -> models -> back to the provider list.
+        await open_model_menu(env.bot, picker)
+        await env.bot.on_selection(
+            callback(picker.message, menu_button(picker.message, "‹ Providers").callback_data), context())
+        assert "Choose a provider:" in picker.message.replies[-1]
+        assert env.bot._session(42) == before
+    asyncio.run(scenario())
+
+
+def test_provider_command_is_merged_away_and_help_names_model(env, monkeypatch):
+    # Building the Application creates a real PTB HTTP client; undo the fixture's
+    # httpx stub for that one construction (it needs to pass its own transport).
+    from httpx._client import AsyncClient as RealAsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", RealAsyncClient)
+    app = env.bot._application()
+    commands = {c for handler in app.handlers[0]
+                if isinstance(handler, transport.CommandHandler)
+                for c in (handler.commands or ())}
+    assert {"model", "persona"} <= commands
+    assert "provider" not in commands
+
+    async def scenario():
+        start = update()
+        await env.bot.cmd_start(start, context())
+        help_text = start.message.replies[-1]
+        assert "/provider" not in help_text
+        assert "/model" in help_text and "/persona" in help_text
     asyncio.run(scenario())
