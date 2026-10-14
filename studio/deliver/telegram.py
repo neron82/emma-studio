@@ -27,6 +27,7 @@ from ..agent.models import (
 )
 from ..core.store import Store
 from ..speech import tts
+from ..speech.utils import whisper_language_code
 from .telegram_config import BotSettings, load_settings
 
 
@@ -157,6 +158,19 @@ class TelegramTransport:
         if not personas:
             raise TransportError("No persona available. Create one in the Studio web UI.")
         return self._create(chat_id, personas[0])
+
+    def _stt_language(self, chat_id: int) -> str:
+        """What the user is speaking, from the persona that answers them.
+
+        The global STT default is pinned to German (auto-detect hallucinates on
+        short chunks), so an English persona would otherwise have its voice notes
+        transcribed as German. Reads the persona without creating a session: a
+        failed transcription must not leave an empty session behind.
+        """
+        from ..speech import stt
+        session = self.store.get_transport_session("telegram", self._key(chat_id))
+        persona = self.store.get_persona(session["persona_id"]) if session else None
+        return whisper_language_code((persona or {}).get("language")) or stt.STT_LANGUAGE
 
     @staticmethod
     def _provider_label(selection: dict) -> str:
@@ -634,7 +648,8 @@ class TelegramTransport:
             try:
                 tg_file = await ctx.bot.get_file(voice.file_id)
                 await tg_file.download_to_drive(path)
-                text = await asyncio.to_thread(stt.transcribe, path)
+                text = await asyncio.to_thread(
+                    stt.transcribe, path, language=self._stt_language(update.effective_chat.id))
             except Exception:
                 raise TransportError("Voice transcription failed. Check the speech service or send text instead.") from None
         if not text or not text.strip():

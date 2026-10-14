@@ -467,7 +467,7 @@ def test_voice_input_uses_durable_turn_and_removes_download(env, monkeypatch, fa
         async def get_file(self, file_id):
             return Download()
 
-    def transcribe(path):
+    def transcribe(path, *, language=None):
         assert path.read_bytes() == b"telegram input"
         if fail_stt:
             raise RuntimeError("secret-token")
@@ -489,6 +489,61 @@ def test_voice_input_uses_durable_turn_and_removes_download(env, monkeypatch, fa
             assert [m["content"] for m in transcript] == ["Transcribed garden plan", "Completed reply."]
             assert message.message.replies == []
     asyncio.run(scenario())
+
+
+def test_voice_notes_are_transcribed_in_the_persona_language(env, monkeypatch):
+    """The STT default is pinned to German; an English persona must not inherit it."""
+    seen = []
+
+    class Download:
+        async def download_to_drive(self, path):
+            path.write_bytes(b"telegram input")
+
+    class Bot:
+        async def get_file(self, file_id):
+            return Download()
+
+    def transcribe(path, *, language=None):
+        seen.append(language)
+        return "Transcribed plan"
+
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    env.store.update_persona(env.other["id"], language="English")
+
+    async def scenario():
+        for target, expected in [(None, "de"), (env.other["name"], "en")]:
+            if target:
+                await env.bot.cmd_persona(update(), context(target))
+                settle(env.bot)
+            message = update("")
+            message.message.voice = SimpleNamespace(file_id="voice-id")
+            await env.bot.on_voice(message, SimpleNamespace(bot=Bot(), args=[]))
+            assert seen[-1] == expected, f"{target or 'first'} -> {seen[-1]}"
+        # An unknown persona language falls back to the global default.
+        env.store.update_persona(env.other["id"], language="Klingon")
+        message = update("")
+        message.message.voice = SimpleNamespace(file_id="voice-id")
+        await env.bot.on_voice(message, SimpleNamespace(bot=Bot(), args=[]))
+        assert seen[-1] == stt.STT_LANGUAGE
+    asyncio.run(scenario())
+    settle(env.bot)
+
+
+def test_unknown_persona_language_does_not_create_a_session_before_transcription(env, monkeypatch):
+    """Reading the language must not leave a session behind when STT then fails."""
+    class FailingBot:
+        async def get_file(self, file_id):
+            raise RuntimeError("secret-token")
+
+    def no_llm(*args, **kwargs):
+        raise AssertionError("no transcription must happen")
+
+    monkeypatch.setattr(stt, "transcribe", no_llm)
+    message = update("")
+    message.message.voice = SimpleNamespace(file_id="voice-id")
+    asyncio.run(env.bot.on_voice(message, SimpleNamespace(bot=FailingBot(), args=[])))
+    assert env.store.list_sessions(transport="telegram") == []
+    assert "transcription failed" in message.message.replies[-1]
 
 
 def test_tappable_provider_model_selection_persists_and_default_is_concrete(env):
