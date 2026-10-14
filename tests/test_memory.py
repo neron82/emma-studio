@@ -29,6 +29,14 @@ def _personas_root(tmp_path, monkeypatch):
     return root
 
 
+def _age(store, session_id, seconds=100000):
+    """Move a finished call into the past, behind the missing-summary grace window."""
+    row = store.get_session(session_id)
+    store.conn.execute("UPDATE sessions SET ended_at=? WHERE id=?",
+                       ((row["ended_at"] or 0) - seconds, session_id))
+    store.conn.commit()
+
+
 def test_append_and_roundtrip(tmp_path, monkeypatch):
     _personas_root(tmp_path, monkeypatch)
     mem.append_summary("abc123", "User and Emma discussed the garden plan.")
@@ -185,6 +193,76 @@ def test_schedule_call_finalization_thread(tmp_path, monkeypatch, store):
     thread.join(timeout=5)
 
     assert "Thread summary text." in mem.load_memory(p["id"])
+
+
+def test_sessions_missing_summary_queues_only_calls_that_lost_theirs(tmp_path, monkeypatch, store):
+    """The retry queue is exactly: finalized, transcript present, no summary."""
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+
+    done = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "summarized", session_id=done["id"])
+    store.finalize_session_now(done["id"])
+    store.set_session_summary(done["id"], "already summarized")
+
+    nothing_said = store.create_session(p["id"])
+    store.finalize_session_now(nothing_said["id"])
+
+    still_running = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "in progress", session_id=still_running["id"])
+
+    lost = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "lost call", session_id=lost["id"])
+    store.finalize_session_now(lost["id"])
+
+    other_lane = store.create_session(p["id"], transport="telegram")
+    store.add_message(p["id"], "user", "other lane", session_id=other_lane["id"])
+    store.finalize_session_now(other_lane["id"])
+
+    assert [row["id"] for row in store.sessions_missing_summary("facetime")] == [lost["id"]]
+    assert {row["id"] for row in store.sessions_missing_summary()} == {lost["id"], other_lane["id"]}
+    assert store.sessions_missing_summary("facetime", exclude_ids=(lost["id"],)) == []
+    assert len(store.sessions_missing_summary(limit=1)) == 1
+    # A call that just ended may still be summarizing: the grace window skips it.
+    assert store.sessions_missing_summary("facetime", older_than=3600) == []
+
+
+def test_retry_missing_summaries_writes_the_entry_that_was_lost(tmp_path, monkeypatch, store):
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+    lost = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "The call that lost its summary.", session_id=lost["id"])
+    store.finalize_session_now(lost["id"])
+    _age(store, lost["id"])                      # the failure happened a while ago
+    monkeypatch.setattr(mem, "summarize_call",
+                        lambda transcript, persona, *, session_id: "Recovered summary text.")
+
+    assert mem.retry_missing_summaries(store, transport="facetime") == 1
+
+    assert (store.get_session(lost["id"]).get("summary") or "") == "Recovered summary text."
+    assert "Recovered summary text." in mem.load_memory(p["id"])
+    assert mem.retry_missing_summaries(store, transport="facetime") == 0   # nothing left
+
+
+def test_retry_missing_summaries_leaves_a_running_summary_alone(tmp_path, monkeypatch, store):
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+    fresh = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "Still being summarized.", session_id=fresh["id"])
+    store.finalize_session_now(fresh["id"])
+    called = []
+
+    def capture(transcript, persona, *, session_id):
+        called.append(session_id)
+        return "Late summary"
+
+    monkeypatch.setattr(mem, "summarize_call", capture)
+
+    assert mem.retry_missing_summaries(store, transport="facetime", older_than=3600) == 0
+    assert called == []
+    # Draining on demand stays possible with an open grace window.
+    assert mem.retry_missing_summaries(store, transport="facetime", older_than=0) == 1
+    assert called == [fresh["id"]]
 
 
 def test_finalize_call_memory_uses_the_session_model_override(tmp_path, monkeypatch, store):

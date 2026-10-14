@@ -651,6 +651,38 @@ class Store:
         self.conn.commit()
         return self.get_session(session_id)
 
+    def sessions_missing_summary(self, transport: str | None = None, *,
+                                 older_than: float = 0.0,
+                                 exclude_ids: tuple[str, ...] = (),
+                                 limit: int = 5) -> list[dict]:
+        """Finalized sessions whose summary never landed — the memory retry queue.
+
+        A summary that fails (LLM error, wrong provider) or a process that dies
+        mid-call leaves ``state='finalized'`` with ``summary`` NULL and the
+        transcript in place, and nothing else ever re-reads those rows. They are
+        the only conversations that would be lost from the persona memory, so
+        they are handed back here instead.
+
+        ``older_than`` skips calls that ended recently, because their summary is
+        normally still running; ``exclude_ids`` covers the call this process just
+        started. Sessions without messages are not queued: there is nothing to
+        summarize, so they would be retried forever.
+        """
+        sql = ("SELECT * FROM sessions WHERE state='finalized'"
+               " AND (summary IS NULL OR summary='')"
+               " AND ended_at IS NOT NULL AND ended_at < ?"
+               " AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id)")
+        params: list = [_now() - max(older_than, 0.0)]
+        if transport is not None:
+            sql += " AND transport=?"
+            params.append(transport)
+        if exclude_ids:
+            sql += f" AND id NOT IN ({','.join('?' * len(exclude_ids))})"
+            params.extend(exclude_ids)
+        sql += " ORDER BY ended_at LIMIT ?"
+        params.append(limit)
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
 
 def _first_embedding(data) -> list[float]:
     """Extract one embedding vector from common server response shapes."""

@@ -53,6 +53,11 @@ def main() -> int:
         from .deliver.telegram import TelegramTransport
 
     store = Store(config.DB_PATH)  # ensure schema exists before transports start
+    # Calls whose summary a previous run lost are retried here. The Telegram
+    # transport sweeps its own lane, so neither can summarize a call twice.
+    from .agent.memory import schedule_memory_retry
+
+    schedule_memory_retry(store, transport="facetime")
     thread = None
     state = {}
     ready = threading.Event()

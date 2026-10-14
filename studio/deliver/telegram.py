@@ -469,6 +469,11 @@ class TelegramTransport:
         use. Returns True when this call won the transition and started a summary.
         """
         row = self.store.finalize_session_now(session["id"])
+        # A summary that failed earlier (dead provider, restart) is retried here:
+        # every finished conversation has to reach the persona's memory. The call
+        # being retired is excluded — its own summary starts below.
+        self._summaries.append(memory.schedule_memory_retry(
+            self.store, transport="telegram", exclude_ids=(session["id"],)))
         if row is None:
             return False  # another finalizer was first
         if not self.store.session_transcript(session["id"]):
@@ -750,6 +755,8 @@ class TelegramTransport:
             initialized = True
             await app.start()
             await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+            # Summaries a previous run lost are picked up on startup.
+            self._summaries.append(memory.schedule_memory_retry(self.store, transport="telegram"))
             if ready is not None:
                 ready.set()
             await stop_event.wait()

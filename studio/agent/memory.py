@@ -197,6 +197,11 @@ def _llm_complete(messages: list[dict], endpoint: ModelEndpoint,
     return (data["choices"][0]["message"].get("content") or "").strip()
 
 
+# How long a finished call is left alone before its missing summary is retried:
+# a summary that is still running must not be produced twice.
+MISSING_SUMMARY_GRACE = 900.0
+
+
 def finalize_call_memory(store, session: dict) -> None:
     """Call finalisieren: Transkript → Zusammenfassung → DB + Memory-Datei.
 
@@ -230,6 +235,37 @@ def finalize_call_memory(store, session: dict) -> None:
                        session["id"], type(exc).__name__)
         return
     logger.info("Call %s in Memory (%d Wörter)", session["id"], count_words(summary))
+
+
+def retry_missing_summaries(store, *, transport: str | None = None,
+                            older_than: float | None = None,
+                            exclude_ids: tuple[str, ...] = (), limit: int = 5) -> int:
+    """Summarize finished calls whose summary never landed.
+
+    The persona's long-term memory grows from every finished conversation, so a
+    failed summary is a queue rather than a loss: this picks those rows up again
+    whenever a service starts or a new conversation begins. ``older_than``
+    defaults to ``MISSING_SUMMARY_GRACE``; pass ``0`` to drain the queue at once.
+    Returns how many calls were retried.
+    """
+    pending = store.sessions_missing_summary(
+        transport,
+        older_than=MISSING_SUMMARY_GRACE if older_than is None else older_than,
+        exclude_ids=exclude_ids, limit=limit,
+    )
+    for session in pending:
+        finalize_call_memory(store, session)
+    if pending:
+        logger.info("Retried %d call(s) that were still missing a summary", len(pending))
+    return len(pending)
+
+
+def schedule_memory_retry(store, **kwargs):
+    """``retry_missing_summaries`` as a daemon thread — each summary is an LLM call."""
+    thread = threading.Thread(target=retry_missing_summaries, args=(store,), kwargs=kwargs,
+                              name="memory-retry", daemon=True)
+    thread.start()
+    return thread
 
 
 def schedule_call_finalization(store, session: dict):

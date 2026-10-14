@@ -1064,6 +1064,33 @@ def test_cancel_tapped_after_a_switch_reports_the_applied_change(env):
     asyncio.run(scenario())
 
 
+def test_a_lost_summary_is_retried_when_the_next_conversation_starts(env):
+    """A failed summary is a queue, not a loss: the next /new drains it."""
+    async def scenario():
+        await env.bot.on_text(update("Remember the garden plan"), context())
+        lost = env.bot._session(42)
+        env.failures["summary"] = True
+        await env.bot.cmd_new(update(), context())
+        settle(env.bot)
+        assert not (env.store.get_session(lost["id"]).get("summary") or "")
+        assert memory.load_memory(env.p["id"]) == ""
+
+        env.failures["summary"] = False
+        # The failure is old enough to be past the grace window, which exists to
+        # keep the retry away from a summary that may still be running.
+        ended = env.store.get_session(lost["id"])["ended_at"]
+        env.store.conn.execute("UPDATE sessions SET ended_at=? WHERE id=?",
+                               (ended - 100000, lost["id"]))
+        env.store.conn.commit()
+        await env.bot.cmd_new(update(), context())
+        settle(env.bot)
+
+        assert env.store.get_session(lost["id"])["summary"] == env.summary
+        assert env.summary in memory.load_memory(env.p["id"])
+    asyncio.run(scenario())
+    settle(env.bot)
+
+
 def test_model_command_starts_with_the_provider_list_then_polls_models(env):
     async def scenario():
         picker = update()
