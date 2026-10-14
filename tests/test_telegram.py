@@ -5,6 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 import shutil
+import threading
 from types import SimpleNamespace
 import wave
 
@@ -106,6 +107,13 @@ async def open_model_menu(bot, message, provider=None):
     return message
 
 
+def settle(bot, timeout=5):
+    """Wait for the background summaries a switch must never block on."""
+    for thread in list(bot._summaries):
+        thread.join(timeout=timeout)
+    return [thread for thread in bot._summaries if thread.is_alive()]
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
@@ -168,6 +176,7 @@ def test_new_summarizes_and_injects_memory_without_old_session_history(env):
         web = env.store.create_session(env.p["id"])
         env.store.add_message(env.p["id"], "user", "private web history", session_id=web["id"])
         await env.bot.cmd_new(update(), context())
+        settle(env.bot)                         # /new answers before the summary exists
         new = env.bot._session(42)
         assert new["id"] != old["id"]
         assert env.store.get_session(old["id"])["state"] == "finalized"
@@ -206,6 +215,7 @@ def test_provider_pending_model_selection_and_restart_are_session_scoped(env):
         assert restarted._session(42)["id"] == sid
         assert env.store.get_persona(env.p["id"])["llm_provider"] == "configured"
         await restarted.cmd_new(update(), context())
+        settle(restarted)
         summaries = [(request, body) for request, body in env.requests if body is not None
                      and body["messages"][0]["content"].startswith("You keep the long-term memory")]
         assert summaries[-1][1]["model"] == "chosen-model"
@@ -224,6 +234,7 @@ def test_persona_switch_closes_old_and_isolates_history_and_memory(env):
         await env.bot.on_text(update("Garden plan"), context())
         old = env.bot._session(42)
         await env.bot.cmd_persona(update(), context(env.other["id"]))
+        settle(env.bot)
         await env.bot.on_text(update("Different persona"), context())
         session = env.bot._session(42)
         assert session["persona_id"] == env.other["id"]
@@ -239,59 +250,58 @@ def test_persona_switch_closes_old_and_isolates_history_and_memory(env):
 
 
 @pytest.mark.parametrize("handler,args", [("cmd_new", ()), ("cmd_persona", ("Other",))])
-def test_summary_failure_leaves_original_session_active(env, handler, args):
+def test_failed_summary_does_not_block_or_undo_the_switch(env, handler, args):
+    """A summary that fails is logged in the background, never a hung menu."""
     async def scenario():
         await env.bot.on_text(update("Keep this conversation"), context())
         old = env.bot._session(42)
         env.failures["summary"] = True
-        failed = update()
-        await getattr(env.bot, handler)(failed, context(*args))
-        assert env.bot._session(42)["id"] == old["id"]
-        assert env.store.get_session(old["id"])["state"] == "active"
-        assert len(env.store.list_sessions(transport="telegram")) == 1
-        assert "still active" in failed.message.replies[-1]
-        assert "secret" not in " ".join(failed.message.replies)
+        switched = update()
+        await getattr(env.bot, handler)(switched, context(*args))
+        settle(env.bot)
+        # The switch is applied and reported even though its summary failed ...
+        assert env.bot._session(42)["id"] != old["id"]
+        assert env.store.get_session(old["id"])["state"] == "finalized"
+        assert transport.SUMMARY_IN_BACKGROUND in " ".join(switched.message.replies)
+        assert "secret" not in " ".join(switched.message.replies)
+        # ... and no half-written memory entry is left behind.
         assert memory.load_memory(env.p["id"]) == ""
+        assert not (env.store.get_session(old["id"]).get("summary") or "")
         env.failures["summary"] = False
-        await getattr(env.bot, handler)(update(), context(*args))
+        await getattr(env.bot, handler)(switched, context(*args))
         assert env.bot._session(42)["id"] != old["id"]
     asyncio.run(scenario())
 
 
-def test_memory_write_failure_preserves_active_history_and_retry(env, monkeypatch):
+def test_memory_write_failure_keeps_the_transcript_and_no_dead_thread(env, monkeypatch):
+    """A failed memory write is logged; the switch stands and no thread dies."""
     append_summary = memory.append_summary
 
     def fail_write(*args, **kwargs):
         raise OSError("private-provider-secret")
+
+    died = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: died.append(args))
 
     async def scenario():
         await env.bot.on_text(update("Preserve my garden plan"), context())
         old = env.bot._session(42)
         transcript = env.store.session_transcript(old["id"])
         monkeypatch.setattr(memory, "append_summary", fail_write)
-        failed = update()
-        await env.bot.cmd_new(failed, context())
-        assert env.bot._session(42)["id"] == old["id"]
-        assert env.store.get_session(old["id"])["state"] == "active"
-        assert env.store.session_transcript(old["id"]) == transcript
-        assert len(env.store.list_sessions(transport="telegram")) == 1
-        assert "still active" in failed.message.replies[-1]
-        assert "secret" not in " ".join(failed.message.replies)
-        assert memory.load_memory(env.p["id"]) == ""
-        await env.bot.on_text(update("Continue the same conversation"), context())
-        assert env.bot._session(42)["id"] == old["id"]
-        assert completions(env)[-1][1]["messages"][1:3] == [
-            {"role": "user", "content": "Preserve my garden plan"},
-            {"role": "assistant", "content": "Completed reply."},
-        ]
-        monkeypatch.setattr(memory, "append_summary", append_summary)
-        await env.bot.cmd_new(update(), context())
-        assert env.bot._session(42)["id"] != old["id"]
+        switched = update()
+        await env.bot.cmd_new(switched, context())
+        settle(env.bot)
+        assert died == []                                   # no traceback with provider text
+        assert env.bot._session(42)["id"] != old["id"]       # the fresh session stands
         assert env.store.get_session(old["id"])["state"] == "finalized"
-        assert env.summary in memory.load_memory(env.p["id"])
-        await env.bot.on_text(update("Recall our plan"), context())
-        assert env.summary in completions(env)[-1][1]["messages"][0]["content"]
-        assert completions(env)[-1][1]["messages"][1:] == [{"role": "user", "content": "Recall our plan"}]
+        assert env.store.session_transcript(old["id"]) == transcript    # raw history kept
+        assert env.store.get_session(old["id"])["summary"] == env.summary
+        assert memory.load_memory(env.p["id"]) == ""
+        # A failed summary is not retried later; the transcript stays in its session.
+        await env.bot.cmd_new(update(), context())
+        settle(env.bot)
+        assert memory.load_memory(env.p["id"]) == ""
+        monkeypatch.setattr(memory, "append_summary", append_summary)
     asyncio.run(scenario())
 
 
@@ -544,6 +554,7 @@ def test_stale_model_menu_cannot_change_current_session(env, change):
         assert rejected.callback_query.answers == 1
         assert completions(env) == []
     asyncio.run(scenario())
+    settle(env.bot)
 
 
 @pytest.mark.parametrize("chat_id,chat_type,user_id", [
@@ -617,6 +628,7 @@ def test_inherited_effective_model_and_local_status_follow_persona_until_explici
         assert completions(env)[-1][1]["model"] == "chosen-model"
         assert env.store.get_persona(env.p["id"])["llm_model"] == "chosen-model"
     asyncio.run(scenario())
+    settle(env.bot)
 
 
 @pytest.mark.parametrize("failure,expected", [
@@ -749,6 +761,7 @@ def test_new_session_memory_search_is_private_and_shared(env, monkeypatch):
     previous = env.bot._session(42)
     env.store.add_message(env.p['id'], 'user', 'Remember my dog Juniper.', session_id=previous['id'])
     asyncio.run(env.bot.cmd_new(update(), context()))
+    settle(env.bot)
     assert env.store.get_session(previous['id'])['state'] == 'finalized'
     assert env.store.search_memory(env.p['id'], 'Juniper', session_id=previous['memory_id'])
     responses = iter([
@@ -928,6 +941,7 @@ def test_persona_switch_after_a_turn_opens_one_new_session_and_reuses_it(env):
         await env.bot.on_text(update("Garden plan"), context())
         first = env.bot._session(42)
         await env.bot.cmd_persona(update(), context(env.other["name"]))
+        settle(env.bot)
         second = env.bot._session(42)
         assert second["id"] != first["id"]                   # a real switch starts fresh
         assert second["persona_id"] == env.other["id"]
@@ -937,6 +951,61 @@ def test_persona_switch_after_a_turn_opens_one_new_session_and_reuses_it(env):
         await env.bot.cmd_persona(update(), context(env.p["name"]))
         assert env.bot._session(42)["id"] == second["id"]
         assert len(env.store.list_sessions(transport="telegram")) == 2
+    asyncio.run(scenario())
+
+
+def test_persona_switch_answers_before_the_summary_finishes(env, monkeypatch):
+    """The reported bug: the menu must never wait for a multi-minute summary."""
+    entered, release = threading.Event(), threading.Event()
+    original = memory.summarize_call
+
+    def slow(transcript, persona=None, *, session_id=None):
+        entered.set()
+        release.wait(timeout=10)
+        return original(transcript, persona, session_id=session_id)
+
+    async def scenario():
+        await env.bot.on_text(update("Garden plan"), context())
+        old = env.bot._session(42)
+        monkeypatch.setattr(memory, "summarize_call", slow)
+        picker = update()
+        await env.bot.cmd_persona(picker, context())
+        await env.bot.on_selection(
+            callback(picker.message, menu_button(picker.message, "Other").callback_data), context())
+        # Answered while the retired session is still being summarized ...
+        assert entered.wait(timeout=5)
+        assert not release.is_set()
+        answer = picker.message.replies[-1]
+        assert "Persona is now Other." in answer
+        assert transport.SUMMARY_IN_BACKGROUND in answer
+        assert env.store.get_session(old["id"])["state"] == "finalized"
+        # ... and the new session takes turns right away, on the new persona.
+        await env.bot.on_text(update("Different persona"), context())
+        assert env.bot._session(42)["persona_id"] == env.other["id"]
+        assert completions(env)[-1][1]["model"] == "other-model"
+        release.set()
+        settle(env.bot)
+        assert env.summary in memory.load_memory(env.p["id"])
+        assert env.store.get_session(old["id"])["summary"] == env.summary
+    asyncio.run(scenario())
+    release.set()
+
+
+def test_cancel_tapped_after_a_switch_reports_the_applied_change(env):
+    """A Cancel racing its own switch must not claim nothing was selected."""
+    async def scenario():
+        picker = update()
+        await env.bot.cmd_persona(picker, context())
+        choose = menu_button(picker.message, "Other").callback_data
+        cancel = menu_button(picker.message, "Cancel").callback_data
+        await env.bot.on_selection(callback(picker.message, choose), context())
+        stale = callback(picker.message, cancel)
+        await env.bot.on_selection(stale, context())
+        answer = picker.message.replies[-1]
+        assert "already applied" in answer
+        assert "Persona: Other" in answer
+        assert "unchanged" not in answer
+        assert stale.callback_query.answers == 1
     asyncio.run(scenario())
 
 

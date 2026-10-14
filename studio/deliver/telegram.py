@@ -12,6 +12,7 @@ import ipaddress
 import logging
 from pathlib import Path
 import tempfile
+import threading
 import secrets
 from urllib.parse import urlsplit
 
@@ -30,6 +31,11 @@ from .telegram_config import BotSettings, load_settings
 
 
 logger = logging.getLogger(__name__)
+
+# A switch or /new must answer immediately: summarizing the retired session is an
+# LLM call that can take minutes, so it runs in the background (see _retire).
+SUMMARY_IN_BACKGROUND = "The previous conversation is still being summarized in the background."
+
 
 # Image mime types by file suffix for the data: URL sent to the vision model.
 # Telegram photos are JPEG; documents carry their own mime_type and take priority.
@@ -99,6 +105,11 @@ class TelegramTransport:
         self.settings = settings if settings is not None else load_settings()
         self._locks: dict[int, asyncio.Lock] = {}
         self._menus: dict[int, dict] = {}
+        # Token of the last applied menu per chat: a button tapped in the same
+        # second as its own switch still arrives after the keyboard is gone.
+        self._applied: dict[int, str] = {}
+        # Background summaries, held so tests and shutdown can wait for them.
+        self._summaries: list[threading.Thread] = []
 
     def _authorized(self, update: Update) -> bool:
         chat = update.effective_chat
@@ -344,26 +355,29 @@ class TelegramTransport:
         else:
             await self._reply(update, self._label(session))
 
-    async def _activate_persona(self, update, session: dict, persona: dict) -> dict:
+    def _activate_persona(self, update, session: dict, persona: dict) -> tuple[dict, bool]:
         """Move this chat onto `persona`, keeping exactly one active session.
 
-        A switch away from a session that holds real messages closes (and
-        summarizes) it and opens a fresh one, so every character change starts a
-        new conversation. A switch away from an EMPTY session instead re-points
-        that same row: flipping through personas therefore no longer leaves a
-        trail of empty sessions and empty summaries behind.
+        A switch away from a session that holds real messages retires it and opens
+        a fresh one, so every character change starts a new conversation. A switch
+        away from an EMPTY session instead re-points that same row: flipping
+        through personas therefore no longer leaves a trail of empty sessions and
+        empty summaries behind.
+
+        Returns the session to use plus whether a summary is still running; the
+        switch itself never waits for it (see `_retire`).
         """
         chat_id = update.effective_chat.id
         self._menus.pop(chat_id, None)
         if persona["id"] == session["persona_id"]:
-            return session
+            return session, False
         if not self.store.session_transcript(session["id"], limit=1):
             retargeted = self.store.retarget_session_persona(
                 session["id"], persona["id"], model_settings=self._selection(persona))
             if retargeted is not None:
-                return retargeted
-        await self._close(session)
-        return self._create(chat_id, persona)
+                return retargeted, False
+        pending = self._retire(session)
+        return self._create(chat_id, persona), pending
 
     async def _choose_persona(self, update, session: dict, persona_id: str):
         persona = self.store.get_persona(persona_id)
@@ -371,12 +385,16 @@ class TelegramTransport:
             raise TransportError("That persona no longer exists. Open /persona again.")
         # Validate the menu BEFORE switching: the switch changes the view key.
         self._ensure_view(update, self._view_key(session))
-        session = await self._activate_persona(update, session, persona)
+        session, pending = self._activate_persona(update, session, persona)
+        text = f"Persona is now {persona['name']}.\nNew session started."
+        if pending:
+            text += " " + SUMMARY_IN_BACKGROUND
+        text += "\n\n" + self._label(session)
         query = getattr(update, "callback_query", None)
         if query:
-            await query.edit_message_text(text=self._label(session), reply_markup=None)
+            await query.edit_message_text(text=text, reply_markup=None)
         else:
-            await self._reply(update, self._label(session))
+            await self._reply(update, text)
 
     @serialized
     async def on_selection(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -385,12 +403,22 @@ class TelegramTransport:
         parts = (query.data or "").split(":")
         if (not record or len(parts) != 3 or parts[0] != "select"
                 or parts[1] != record["token"] or parts[2] not in record["choices"]):
-            raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
+            if len(parts) == 3 and parts[0] == "select" and parts[1] == self._applied.get(update.effective_chat.id):
+                # The tap raced its own switch: the keyboard was still on screen
+                # for a moment after the change had already been applied. Report
+                # what happened instead of claiming nothing was selected.
+                await query.edit_message_text(
+                    text="That selection was already applied.\n\n"
+                         + self._label(self._session(update.effective_chat.id)), reply_markup=None)
+                return
+            raise TransportError("This menu is out of date. Open the command again; selection unchanged.")
         session = self._session(update.effective_chat.id)
         if record["key"] != self._view_key(session):
             self._menus.pop(update.effective_chat.id, None)
             raise TransportError("This menu is out of date. Open /model again; selection unchanged.")
         action, value = record["choices"][parts[2]]
+        if action in ("persona", "provider", "inherit", "model", "default"):
+            self._applied[update.effective_chat.id] = parts[1]
         if action == "cancel":
             self._menus.pop(update.effective_chat.id, None)
             await query.edit_message_text(text="Cancelled. Selection unchanged.", reply_markup=None)
@@ -417,27 +445,22 @@ class TelegramTransport:
                                      expected_base=record["discovered"]["base_url"],
                                      expected_models=record["rows"])
 
-    async def _close(self, session: dict):
-        transcript = self.store.session_transcript(session["id"])
-        summary = ""
-        if transcript:
-            try:
-                summary = await asyncio.to_thread(
-                    memory.summarize_call, transcript, self._effective_persona(session),
-                    session_id=session["id"],
-                )
-                if not summary.strip():
-                    raise ValueError("empty summary")
-            except Exception:
-                raise TransportError("Could not summarize this conversation. The current session is still active; check the selected model/provider, then retry /new or /persona. No new session was created.") from None
-        if summary:
-            try:
-                await asyncio.to_thread(memory.append_summary, session["persona_id"], summary, session=session)
-            except Exception:
-                raise TransportError("The persona memory file could not be updated. The current session is still active; check data-directory permissions and retry /new or /persona. No new session was created.") from None
-        finalized = self.store.finalize_session_now(session["id"])
-        if finalized and summary:
-            self.store.set_session_summary(session["id"], summary)
+    def _retire(self, session: dict) -> bool:
+        """Finalize a finished session and summarize it in the background.
+
+        The DB transition is instant; the summary is an LLM call that can take
+        minutes. Running it inside the handler made a switch look hung until the
+        user cancelled a change that had in fact already been applied, so the
+        summary goes to the same background finalizer the web and realtime paths
+        use. Returns True when this call won the transition and started a summary.
+        """
+        row = self.store.finalize_session_now(session["id"])
+        if row is None:
+            return False  # another finalizer was first
+        if not self.store.session_transcript(session["id"]):
+            return False  # nothing to summarize
+        self._summaries.append(memory.schedule_call_finalization(self.store, row))
+        return True
 
     @serialized
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -449,10 +472,13 @@ class TelegramTransport:
         old = self._session(update.effective_chat.id)
         persona = self._effective_persona(old)
         selection = self._selection(persona)
-        await self._close(old)
+        pending = self._retire(old)
         new = self._create(update.effective_chat.id, persona, selection,
                            override=bool(old.get("llm_override")))
-        await self._reply(update, "New conversation; previous memory is available.\n" + self._label(new))
+        notice = "New conversation; previous memory is available."
+        if pending:
+            notice = "New conversation. " + SUMMARY_IN_BACKGROUND
+        await self._reply(update, notice + "\n" + self._label(new))
 
     @serialized
     async def cmd_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -467,8 +493,11 @@ class TelegramTransport:
         matches = [p for p in personas if p["id"] == choice or p["name"].casefold() == choice.casefold()]
         if len(matches) != 1:
             raise TransportError("Persona not found or name ambiguous. Use /persona to pick from the list.")
-        session = await self._activate_persona(update, session, matches[0])
-        await self._reply(update, self._label(session))
+        session, pending = self._activate_persona(update, session, matches[0])
+        text = f"Persona is now {matches[0]['name']}.\nNew session started."
+        if pending:
+            text += " " + SUMMARY_IN_BACKGROUND
+        await self._reply(update, text + "\n\n" + self._label(session))
 
     @serialized
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):

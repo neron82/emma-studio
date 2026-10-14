@@ -209,12 +209,26 @@ def finalize_call_memory(store, session: dict) -> None:
         return
     try:
         persona = store.get_persona(session["persona_id"])
+        if persona and session.get("llm_override"):
+            # A session-level /model choice is the model this conversation ran on;
+            # summarizing it with the persona default would use the wrong endpoint
+            # (and fails outright for a provider that has no model yet).
+            persona = {**persona, **{key: session.get(key) for key in
+                                     ("llm_provider", "llm_base_url", "llm_model")}}
         summary = summarize_call(transcript, persona, session_id=session["id"])
     except Exception as exc:  # noqa: BLE001 — Call bleibt finalisiert, nur ohne Memory
-        logger.exception("Memory-Zusammenfassung für Call %s fehlgeschlagen: %s", session["id"], exc)
+        # Stage and class only: provider bodies, paths and tokens live in exception
+        # text, and this runs in a daemon thread whose traceback nobody curates.
+        logger.warning("Memory summary for session %s failed (error=%s)",
+                       session["id"], type(exc).__name__)
         return
-    store.set_session_summary(session["id"], summary)
-    append_summary(session["persona_id"], summary, session=session)
+    try:
+        store.set_session_summary(session["id"], summary)
+        append_summary(session["persona_id"], summary, session=session)
+    except Exception as exc:  # noqa: BLE001 — der Call bleibt finalisiert
+        logger.warning("Memory write for session %s failed (error=%s)",
+                       session["id"], type(exc).__name__)
+        return
     logger.info("Call %s in Memory (%d Wörter)", session["id"], count_words(summary))
 
 

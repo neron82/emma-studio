@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -184,6 +185,71 @@ def test_schedule_call_finalization_thread(tmp_path, monkeypatch, store):
     thread.join(timeout=5)
 
     assert "Thread summary text." in mem.load_memory(p["id"])
+
+
+def test_finalize_call_memory_uses_the_session_model_override(tmp_path, monkeypatch, store):
+    """A /model choice is the model the call ran on, so it summarizes that call."""
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+    session = store.create_session(p["id"])
+    store.update_session_model(session["id"], llm_provider="opencode-go",
+                              llm_base_url="", llm_model="chosen-model")
+    store.add_message(p["id"], "user", "Hi Emma, how are you?", session_id=session["id"])
+    seen = {}
+
+    def capture(transcript, persona, *, session_id):
+        seen["persona"] = persona
+        return "Summary via the session model."
+
+    monkeypatch.setattr(mem, "summarize_call", capture)
+    mem.finalize_call_memory(store, store.get_session(session["id"]))
+
+    assert seen["persona"]["llm_provider"] == "opencode-go"
+    assert seen["persona"]["llm_model"] == "chosen-model"
+    assert seen["persona"]["name"] == "Emma"          # the rest of the persona survives
+    assert "Summary via the session model." in mem.load_memory(p["id"])
+
+
+def test_finalize_call_memory_keeps_persona_settings_without_an_override(tmp_path, monkeypatch, store):
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+    session = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "hello", session_id=session["id"])
+    seen = {}
+
+    def capture(transcript, persona, *, session_id):
+        seen["persona"] = persona
+        return "Summary via the persona."
+
+    monkeypatch.setattr(mem, "summarize_call", capture)
+    mem.finalize_call_memory(store, store.get_session(session["id"]))
+
+    assert seen["persona"]["llm_provider"] == p["llm_provider"]
+    assert seen["persona"]["llm_model"] == p["llm_model"]
+
+
+def test_finalize_call_memory_survives_a_memory_write_failure(tmp_path, monkeypatch, store):
+    """A failing memory write must not kill the daemon thread with a traceback."""
+    _personas_root(tmp_path, monkeypatch)
+    p = store.create_persona("Emma")
+    session = store.create_session(p["id"])
+    store.add_message(p["id"], "user", "Preserve this.", session_id=session["id"])
+    monkeypatch.setattr(mem, "summarize_call",
+                        lambda transcript, persona, *, session_id: "Summary text.")
+
+    def fail_write(*args, **kwargs):
+        raise OSError("private-provider-secret")
+
+    monkeypatch.setattr(mem, "append_summary", fail_write)
+    died = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: died.append(args))
+    thread = mem.schedule_call_finalization(store, session)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert died == []                                     # no dead thread, no traceback
+    assert (store.get_session(session["id"]).get("summary") or "") == "Summary text."
+    assert not mem.memory_path(p["id"]).exists()
 
 
 def test_system_prompt_injects_memory(tmp_path, monkeypatch):
