@@ -87,7 +87,7 @@ def _user_content(text: str, image_data_url: str | None):
 async def chat(persona: dict, history: list[dict], user_message: str,
                facts: list[dict], search_results: list[dict] | None = None,
                *, session_id: str | None = None, store=None,
-               image_data_url: str | None = None) -> str:
+               image_data_url: str | None = None, timeout: float = 300) -> str:
     """One user turn with private retrieval. History excludes the system prompt.
 
     ``image_data_url`` (optional) attaches one image to the current user turn as
@@ -98,7 +98,7 @@ async def chat(persona: dict, history: list[dict], user_message: str,
     messages: list[dict] = [{"role": "system", "content": build_system_prompt(persona, facts, search_results, store=store)}]
     messages += history[-12:]  # keep context bounded
     messages.append({"role": "user", "content": _user_content(user_message, image_data_url)})
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for count in range(MAX_MEMORY_CALLS + 1):
             resp = await client.post(
                 f"{endpoint.base_url.rstrip('/')}/chat/completions",

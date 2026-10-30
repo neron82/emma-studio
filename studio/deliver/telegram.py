@@ -557,7 +557,7 @@ class TelegramTransport:
         self.store.add_message(persona["id"], "user", stored, session_id=session["id"])
         try:
             response = await dialog.chat(persona, history, text, facts, session_id=session["id"],
-                                         store=self.store, image_data_url=image_data_url)
+                                         store=self.store, image_data_url=image_data_url, timeout=900)
             if not isinstance(response, str) or not response.strip():
                 raise ValueError("empty reply")
         except Exception as exc:
