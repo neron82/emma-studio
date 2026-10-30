@@ -35,6 +35,7 @@ def _mock_tts():
     return fake
 
 
+@pytest.mark.needs_embed
 def test_call_turn_with_facts(store, persona):
     store.add_fact("User has a dog named Bruno", persona_id=persona["id"])
     job = store.create_job(persona["id"], "call_turn", "Wie heißt mein Hund?")

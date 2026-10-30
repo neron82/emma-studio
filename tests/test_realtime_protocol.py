@@ -500,6 +500,7 @@ def test_lazy_build_failure_surfaces_engine_unavailable():
                 ws.receive_json()  # server closed after the error → raises
 
 
+@pytest.mark.needs_embed
 def test_typed_user_message_gets_facts_and_persistence(session):
     """Typed input bypasses STT, so it must get the fact refresh + history row itself."""
     ws, unit, db, persona_id, session_id = session

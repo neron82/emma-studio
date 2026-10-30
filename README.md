@@ -121,11 +121,12 @@ workflows/             ComfyUI graphs used by the render module
 python -m pytest tests/ -q
 ```
 
-The suite is isolated: no model, TTS, ComfyUI or Telegram network is required. It covers the
-realtime protocol and model routing, sessions and memory retrieval, the pipeline state machine,
-Telegram command and voice paths, backchannels, silent turns, speech utilities and visual cycles.
-`AUDIT-2026-09-22.md` records the last full code audit — the defects it found, what was removed,
-and what is still structural work.
+The suite uses fakes for the model, TTS, ComfyUI and Telegram, so no network is needed for the
+core paths. Fact-retrieval tests need the local bge-m3 embedding service and skip when it is not
+running; the backchannel tests also need the filler clips under `data/fillers` (generated with
+`scripts/gen_fillers.py`) and skip without them. Last verified on this machine: **198 passed,
+5 skipped**. `AUDIT-2026-09-22.md` records the last full code audit — the defects it found, what
+was removed, and what is still structural work.
 
 ## Limits
 

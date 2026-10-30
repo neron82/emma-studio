@@ -402,12 +402,13 @@ def test_concurrent_turns_are_serialized_and_chats_remain_isolated(env, monkeypa
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed(persona, history, text, facts, *, session_id, store, image_data_url=None):
+    async def delayed(persona, history, text, facts, *, session_id, store, image_data_url=None, timeout=None):
         if text == "First":
             entered.set()
             await release.wait()
+        extra = {} if timeout is None else {"timeout": timeout}
         return await original(persona, history, text, facts, session_id=session_id, store=store,
-                              image_data_url=image_data_url)
+                              image_data_url=image_data_url, **extra)
 
     monkeypatch.setattr(transport.dialog, "chat", delayed)
     async def scenario():
