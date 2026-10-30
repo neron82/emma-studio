@@ -2,7 +2,7 @@
 # Emma Studio — Stack-Steuerung
 #
 # Startet/stoppt den kompletten Studio-Stack in Abhängigkeitsreihenfolge:
-#   1. Gemma-4-LLM   :8080  → ~/models/gemma4_26b/launch-llama-server.sh   (GPU0)
+#   1. Gemma-4-LLM   :8080  → local llama-server launcher (GPU0)
 #   2. OmniVoice TTS :8880  → systemd --user omnivoice.service             (GPU1)
 #   3. Emma Studio   :8890  → systemd --user emma-studio.service
 #

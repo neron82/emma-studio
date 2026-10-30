@@ -19,7 +19,7 @@ Das ist ein *Hardware*-Test: er braucht die echten Modelle (~15,5 GB Download/
 VRAM auf Gerät 1) und darf nie im Studio-Prozess laufen (er beendet sich im
 Fehlerfall selbst). Aufruf:
 
-    cd ~/projects/emma-studio
+    cd /path/to/emma-studio
     python scripts/repro_vlm_stt_race.py
 """
 from __future__ import annotations

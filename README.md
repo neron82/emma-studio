@@ -1,273 +1,138 @@
 # Emma Studio
 
-Studio für Avatar-Kommunikation: Audioanrufe, animierte Avatar-Videoanrufe
-und fotorealistische Video-Messages. Neubau — ersetzt langfristig den alten Chatbot.
+Three tiers of talking to a machine, all of it running on the box under my desk: a **phone call**,
+a **FaceTime-style call with an animated avatar**, and a **photoreal video message**. FastAPI and
+OpenAI-Realtime events, faster-whisper for hearing, OmniVoice for speaking, three.js VRM for the
+face, ComfyUI for the rendered one. The brain is whatever local model is loaded today — I swap
+heads, she keeps talking.
 
-## Architektur
+| Tier | Look | Status |
+|---|---|---|
+| Phone call | Audio only | **live** — `/v1/realtime`: VAD → STT → LLM → TTS, barge-in, persona + RAG |
+| FaceTime | VRM avatar in the browser | **live** — three-vrm, viseme lip-sync from `emma.visemes` |
+| Video message | Photoreal (MiniMax H3) | **module complete, web wiring open** |
+
+## How a call runs
+
+Microphone audio goes through Silero VAD with a semantic end-of-turn check, into faster-whisper,
+through the persona's language model, and back out as cloned speech — all over the OpenAI-Realtime
+event set, so the client is a WebSocket and not a custom protocol. Interrupting mid-reply cancels
+the answer and reopens the turn; the measured perceived first-audio is **1.7–3.1 s**, partly bought
+with well-placed "hm". The pipeline is a small pool of threaded units, one conversation each, with a
+device lock so STT and the vision model never fight over the same GPU.
+
+## Memory you can query
+
+Every conversation is stored in SQLite. Retrieval is a hybrid: **FTS5** for the words you remember
+plus **bge-m3** embeddings for the ones you don't. Persona-scoped facts rank ahead of global ones,
+and a persona keeps a rolling long-term summary that survives session resets. Add a fact from the
+web UI or with `/fact <text>` in Telegram.
+
+## The face
+
+The browser call is a Facetime-style view of a **three.js VRM avatar**, lip-synced by viseme
+events from the speech pipeline. Microphone and camera are requested only when a call starts, and
+mute / camera / hang up stay one tap away during the conversation. A transcript runs beside the
+call, and you can type into a live call when talking is inconvenient.
+
+The portrait is generated once and cloned forever. She finds this funny.
+
+## Video messages
+
+`studio/render/comfy.py` drives ComfyUI: identity-locked keyframes, MiniMax H3 reference-to-video,
+and RTX Video Super Resolution for the final pass. The module is finished and tested; connecting it
+to the web UI is the remaining piece. It needs ComfyUI running with the matching workflow.
+
+## Telegram: text in, voice out
+
+A separate transport, not a bridge into the realtime call. Every answer is stored as text in the
+session but delivered in the chat **only as a voice message**, synthesized in the persona's voice
+and language and converted to OGG/Opus. Commands stay text: `/start`, `/persona`, `/provider`,
+`/model`, `/new`, `/fact`, plus the optional `/video`.
+
+Only private chats on an explicit allowlist are served; an empty allowlist refuses to start instead
+of opening the bot to the world. One poller per bot token — do not run this and an older bot on the
+same token at once.
+
+## Quickstart
+
+Python 3.12, plus the services the stack expects: a local OpenAI-compatible LLM, OmniVoice for TTS,
+and optionally SearXNG and bge-m3 for search and fact retrieval.
+
+```bash
+python -m pip install -e '.[dev]'
+cp .env.example .env        # then fill in your endpoints and keys
+./studio.sh start           # LLM → TTS → studio, in that order
+./studio.sh status
+./studio.sh stop
+```
+
+Open **https://127.0.0.1:8890**. Microphone and camera need a secure context: HTTPS or `localhost`.
+`./studio.sh start --no-llm` skips the local model when you point a persona at a cloud endpoint or
+the VRAM is needed elsewhere. Nothing autostarts — the stack takes VRAM only on request.
+
+## Configuration
+
+All settings are environment variables; secrets belong in `.env`, which is git-ignored and never
+read back out through the API.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STUDIO_LLM_BASE_URL` | OpenRouter-compatible endpoint | language model server |
+| `STUDIO_LLM_MODEL` | provider default | model id |
+| `STUDIO_LLM_API_KEY` | empty | key for that endpoint |
+| `STUDIO_OMNIVOICE_URL` | `http://127.0.0.1:8880` | TTS service |
+| `STUDIO_COMFY_URL` | `http://127.0.0.1:8188` | ComfyUI for video messages |
+| `STUDIO_SEARXNG_URL` | `http://127.0.0.1:8081` | web-search fallback |
+| `STUDIO_EMBED_URL` | `http://127.0.0.1:7777` | bge-m3 embeddings for facts |
+| `STUDIO_REALTIME` | `1` | mount `/v1/realtime` |
+| `STUDIO_TG_BOT_TOKEN` | — | Telegram transport, if used |
+| `STUDIO_TG_ALLOWED_CHATS` | inherited predecessor list | comma-separated private chat ids |
+
+Each persona can override the endpoint, model and voice in the web UI; a persona-specific endpoint
+receives the configured API key only when protocol, host and port match the main endpoint. The
+Telegram transport can also read its token in place from a predecessor installation via
+`STUDIO_TG_CHATBOT_DIR` — nothing is imported or copied.
+
+## Architecture
 
 ```
 studio/
-├── config.py          # eine Config für alles (LLM, Speech, Render, RAG)
+├── config.py          one config for everything (LLM, speech, render, RAG)
 ├── core/
-│   ├── store.py       # SQLite: personas / jobs / facts (FTS5 + bge-m3 hybrid)
-│   └── pipeline.py    # Job-State-Machine: draft→scripted→voiced→rendering→done
+│   ├── store.py       SQLite: personas / jobs / facts (FTS5 + bge-m3 hybrid)
+│   └── pipeline.py    job state machine: draft → scripted → voiced → rendering → done
 ├── agent/
-│   ├── dialog.py      # Persona-Prompt + Faktenkarten → LLM-Turn
-│   └── search.py      # SearXNG-Fallback bei unbeantwortbaren Fragen
-├── speech/
-│   ├── engine.py      # Realtime-Engine: VAD→STT→LLM→TTS Thread-Pool (Lazy-Build)
-│   ├── vad_handler.py # Silero-VAD + smart-turn (semantisches Ende, Barge-in)
-│   ├── stt.py         # faster-whisper (lazy, resident — geteilt mit Realtime-STT)
-│   ├── tts.py         # OmniVoice (/v1/audio/speech, Profile-Voices)
-│   └── router.py      # h3_native vs tts_pre Entscheidung
-├── render/comfy.py    # ComfyUI-Client + Workflow-Injektion (fl2va BF16, RTX 2x)
+│   ├── dialog.py      persona prompt + fact cards → one LLM turn
+│   └── search.py      SearXNG fallback for questions the facts cannot answer
+├── speech/            VAD, STT, TTS, turn-taking, barge-in, smart-turn
+├── render/comfy.py    ComfyUI client + workflow injection (MiniMax H3, RTVSR)
 └── deliver/
-    ├── app.py         # FastAPI + Web-UI (:8890)
-    ├── realtime/      # OpenAI-Realtime WebSocket (/v1/realtime) + Service/Router
-    └── telegram.py    # Smart_Hermione_bot Transport (--telegram Flag)
+    ├── app.py         FastAPI + web UI (:8890)
+    ├── realtime/      OpenAI-Realtime WebSocket (/v1/realtime)
+    └── telegram.py    Telegram transport (text in, voice out)
+web/                   browser UI and the three-vrm avatar stage
+workflows/             ComfyUI graphs used by the render module
 ```
-
-## Ebenen
-
-| Ebene | Optik | Status |
-|---|---|---|
-| Telefonat | Audio-only | **live** — OpenAI-Realtime WS (`/v1/realtime`): VAD→STT→LLM→TTS, Barge-in, Persona+RAG |
-| Facetime | VRM-Avatar im Browser | **live** (three-vrm, Viseme-Lip-Sync via `emma.visemes`) |
-| Video Message | fotoreal (MiniMax H3) | Modul fertig, Anbindung offen |
-
-## Web-Oberfläche
-
-- **Anrufe:** Kontakt auswählen, dann Audio oder Videoanruf starten. Mikrofon und
-  Kamera werden erst auf Anfrage aktiviert; im Gespräch sind Stummschalten,
-  Kamera ein/aus und Auflegen direkt erreichbar.
-- **Transkript:** Gespräch mitlesen und während eines Anrufs Text senden.
-- **Einstellungen:** Personas erstellen und Persönlichkeit, Kontaktportrait,
-  Avatar (Emma oder Standard), Stimme und Sprache anpassen. Unter **Sprachmodell**
-  wählt jede Persona ihren konfigurierten OpenAI-kompatiblen Endpunkt oder
-  **OpenCode Go** und ein Modell. Die Modellliste wird beim Öffnen, beim
-  Anbieterwechsel und alle 30 Sekunden in den sichtbaren Einstellungen vom
-  Anbieter abgerufen; **Aktualisieren** lädt sie sofort neu. Während eines
-  Anrufs bleiben Persona und Einstellungen gesperrt; die Navigation bleibt möglich.
-- **Wissen:** Erinnerungen für den ausgewählten Kontakt verwalten und suchen.
-- Technische Anzeigen liegen unter **Einstellungen → Studio-Diagnose**.
-  `Alt+P` öffnet die Pipeline-Diagnose; Strg + Backtick öffnet die Debug-Konsole.
-- Mikrofon und Kamera benötigen HTTPS oder einen lokalen `localhost`-Kontext.
-  Portrait-Anfragen verwenden `/api/personas/portrait?persona_id=<id>`.
-
-## RAG — Faktenkarten, keine Session-Dumps
-
-`facts`-Tabelle mit FTS5 + bge-m3-Embeddings (Hybrid-Ranking). Einfügen per
-Web-UI oder `/fact <text>` in Telegram. Persona-scoped Facts ranken vor globalen.
-
-## Start
-
-```bash
-./studio.sh start            # ganzer Stack: Gemma-LLM (:8080) → TTS (:8880) → Studio (:8890)
-./studio.sh status           # Units + Ports + geteilte Dienste
-./studio.sh stop
-./studio.sh start --no-llm   # ohne lokales LLM (Cloud-Modell, oder wenn der VRAM anderswo läuft)
-```
-
-Kein Autostart: `emma-studio.service` und `omnivoice.service` sind bewusst *disabled* — der
-Stack belegt VRAM nur auf Zuruf. Das LLM steuert `~/models/gemma4_26b/launch-llama-server.sh`
-(GPU0, Kontext-Autosizing nach freiem VRAM, MTP-Draft); die Unit `llama-llm.service` ist
-veraltet und wird nicht benutzt. Geteilte Dienste (SearXNG :8081, bge-m3 :7777) gehören nicht
-zum Stack und werden nie angefasst — `status` zeigt nur, ob sie erreichbar sind.
-
-## Telegram: Textdialog mit vollständiger Sprachantwort
-
-Telegram ist ein eigenständiger Übergangs-Transport für Textchat mit
-Sprachantwort, kein Messenger-Videoanruf und keine Realtime-Audiobrücke.
-Der normale Dialogpfad verwendet direkt Session-Store, Dialog-Agent und
-vollständige TTS-Dateien; er startet keine Facetime-Pipeline und keine
-satzweise geschnittenen `call_turn`-Jobs.
-
-```bash
-systemctl --user start omnivoice.service
-python -m studio.deliver.telegram
-# Alternativ gemeinsam mit der Web-App (nur eine Variante starten):
-python -m studio --telegram
-```
-
-Die Dashboard-Karte **Emma Studio** steuert `emma-studio.service` direkt.
-Die Unit startet `python -m studio --telegram` mit HTTPS auf Port 8890;
-Dashboard-Start/Stop/Restart betrifft nur Studio, nicht OmniVoice oder das LLM.
-Für direkte HTTPS-Starts sind `--ssl-certfile` und `--ssl-keyfile` gemeinsam
-anzugeben; ohne beide Optionen bleibt der direkte CLI-Start HTTP.
-
-Bei lokalen Sprachmodellen muss auch deren Server laufen. Cloud-Auswahl
-benötigt kein lokales LLM. Telegram-only lädt weder VAD noch STT/VLM/TTS-
-Streaming-Handler; Sprachnachrichten laden STT erst bei Bedarf.
-`ffmpeg` mit `libopus` wird für echte OGG/Opus-Voice-Nachrichten benötigt.
-
-### Konto und Zugriff
-
-Standardmäßig werden Bot-Token und Name **in-place** aus
-`~/projects/chatbot/telegram_secrets.json` (`bot_token`) und
-`telegram_settings.json` (`bot_name`) gelesen. Der Vorgänger wird dabei
-weder importiert noch gestartet; Zugangsdaten werden nicht kopiert.
-Overrides: `STUDIO_TG_CHATBOT_DIR`, `STUDIO_TG_BOT_TOKEN`,
-`STUDIO_TG_BOT_NAME` und `STUDIO_TG_ALLOWED_CHATS`.
-
-Nur private Chats aus einer nichtleeren Allowlist sind erlaubt. Ohne explizites
-`STUDIO_TG_ALLOWED_CHATS` werden bekannte positive Chat-IDs aus den
-Vorgänger-Mappings `chat_sessions` und `chat_audio_modes` übernommen.
-Eine explizit leere Allowlist bricht den Start ab, statt öffentlichen Zugriff
-zu erlauben. Gruppen werden unabhängig von der Allowlist ignoriert.
-
-**Nur ein Poller pro Bot-Token:** Vor dem Start den alten Chatbot-Poller
-beenden; eigenständigen Telegram-Transport und `--telegram` nicht zugleich
-mit demselben Konto verwenden.
-
-### Befehle und Sessions
-
-- `/start`: Hilfe und aktuelle Persona, Session, Anbieter und Modell.
-- `/persona`: Personas auflisten; `/persona <Name oder ID>` wechselt die Persona.
-  Die bisherige Session wird vorher zusammengefasst und geschlossen.
-- `/provider`: Antippbare Anbieter-Auswahl mit tatsächlichem Endpunktnamen
-  (z. B. **Local [127.0.0.1:8080]** oder **OpenCode Go**) statt interner IDs.
-  **Use persona settings** übernimmt wieder die Einstellungen der Web-Persona.
-  Nach der Anbieterwahl erscheint direkt die Modellauswahl.
-- `/model`: Dynamisch abgerufene, antippbare Modellliste mit Seitennavigation
-  und markierter aktueller Auswahl. Der Server-Standard wird mit seinem
-  konkreten Modellnamen angezeigt. Es muss keine ID eingegeben werden;
-  `/model <Modell-ID>` bleibt als optionale Experten-Eingabe möglich.
-- `/new`: Aktuelle Session zusammenfassen, in den gemeinsamen Persona-
-  Memory-Pool aufnehmen und eine neue Session mit derselben Auswahl beginnen.
-  Bei einem Zusammenfassungs- oder Memory-Schreibfehler bleibt die bisherige
-  Session aktiv, ohne eine neue Session anzulegen.
-- `/fact <Text>`: Persona-Fakt speichern. Sprachnachrichten und
-  `/video <Thema>` bleiben als optionale Kompatibilitätsfunktionen erhalten.
-  `/video` nutzt weiterhin den separaten Video-Jobpfad mit der im Web
-  gespeicherten Persona-Konfiguration, nicht die Telegram-Modellüberschreibung.
-
-Laufende Telegram-Sessions überstehen Neustarts. Ohne ausdrückliche Auswahl
-im Telegram-Chat werden Anbieter und Modell von der aktuellen Web-Persona
-übernommen; Änderungen im Web wirken auch auf eine bestehende geerbte Session.
-Eine explizite Telegram-Auswahl bleibt pro Bot/Chat gespeichert, verändert
-keine Web-Persona-Konfiguration und bleibt über `/new` erhalten.
-Statusmeldungen zeigen den tatsächlichen Anbieter/Endpunkt, das aufgelöste
-Modell und die Auswahlquelle (**persona settings** oder **session choice**).
-Alte leere lokale Standard-Auswahlen werden beim Datenbank-Upgrade als geerbt
-behandelt; vorhandene nichtleere Modellauswahlen bleiben explizit erhalten.
-`/provider` bleibt auch bei fehlenden Cloud-Zugangsdaten verfügbar, damit ein
-anderer Endpunkt gewählt werden kann. Ändert sich die Persona während eines
-Modellabrufs, wird die veraltete Menüauswahl ohne Session-Änderung abgewiesen;
-`/provider` oder `/model` öffnet eine aktuelle Liste.
-Neuer Telegram-Kontext enthält nur die Nachrichten
-seiner eigenen Session plus den bestehenden Systemprompt mit früheren
-Persona-Zusammenfassungen und passenden Fakten. Facetime-Historie und
-Telegram-Live-Historie bleiben getrennt; Telegram blockiert oder beendet
-keine Web-Anrufe. Der Persona-Memory-Pool ist absichtlich transportübergreifend.
-
-Jede Antwort wird als vollständiger Text in der Session gespeichert, aber im
-Telegram-Chat ausschließlich als Voice-Nachricht versendet — ohne zusätzliche
-Textantwort. OmniVoice synthetisiert die komplette Antwort mit Stimme und
-Sprache der Persona in eine WAV-Datei; der Transport konvertiert sie zu
-OGG/Opus. Temporäre Dateien werden auch bei Fehlern entfernt. Scheitert TTS
-oder Versand, bleiben Text und Session erhalten; der Chat erhält nur eine
-kurze Fehlermeldung. Befehle, Auswahlmenüs und Statusmeldungen bleiben Text.
-Modellfehler nennen die betroffene Anbieter-/Modellauswahl und unterscheiden
-Verbindungsfehler, Zeitüberschreitungen und HTTP-Fehler des Anbieters.
-Schlüssel, Telegram-Token und rohe Anbieter-Antworten werden nicht ausgegeben.
-
-## Secrets (.env)
-
-```
-STUDIO_LLM_API_KEY=...        # OpenRouter
-STUDIO_TG_BOT_TOKEN=...       # aus ~/projects/chatbot/telegram_secrets.json
-STUDIO_TG_ALLOWED_CHATS=<chat-id>
-```
-
-### Cloud-Modelle: OpenCode Go
-
-In den Persona-Einstellungen **OpenCode Go** auswählen, ein Modell aus der
-Liste wählen und speichern. Die Auswahl gilt für Echtzeitgespräche,
-Textantworten, Video-Skripte und Gesprächszusammenfassungen. Bestehende Personas
-übernehmen weiterhin `STUDIO_LLM_BASE_URL`, `STUDIO_LLM_MODEL` und
-`STUDIO_LLM_API_KEY`; ein leerer Modellwert beim konfigurierten Anbieter
-übernimmt dessen Server-Standard.
-Ein persona-spezifischer Endpunkt erhält den konfigurierten API-Schlüssel nur,
-wenn Protokoll, Host und effektiver Port mit dem Server-Endpunkt übereinstimmen.
-Andere Endpunkte werden ohne diesen Schlüssel angesprochen.
-Ohne `STUDIO_LLM_API_KEY` wird für diesen vertrauenswürdigen Ursprung auch
-`OPENAI_API_KEY` übernommen, wie bisher beim Echtzeit-Client.
-
-Der Server liest OpenCode-Go-Zugangsdaten zuerst aus
-`STUDIO_OPENCODE_GO_API_KEY`, sonst aus dem `opencode-go`-Credential-Pool in
-`~/.hermes/auth.json`, danach aus `OPENCODE_GO_API_KEY` in Hermes' `.env`.
-`HERMES_HOME` kann das Hermes-Verzeichnis ändern. Der Schlüssel bleibt auf dem
-Server und wird weder in Persona-Daten noch an den Browser übertragen.
-Optional setzt `STUDIO_OPENCODE_GO_BASE_URL` den serverseitigen Endpunkt;
-standardmäßig ist es `https://opencode.ai/zen/go/v1`, beziehungsweise der im
-Hermes-Pool hinterlegte Endpunkt. Go-Zugangsdaten werden niemals an eine
-persona-spezifische URL gesendet.
-
-Die Modellauswahl kommt authentifiziert von `/models` am API-Basisendpunkt
-(für Go: `/zen/go/v1/models`); es gibt keine fest hinterlegte Modellliste.
-Eine gespeicherte Auswahl bleibt bei Discovery-Fehlern oder verschwundenen
-Modellen erhalten und wird entsprechend gekennzeichnet. Cloud-Fehler werden
-nicht durch einen stillen Wechsel zum lokalen Modell kaschiert.
-
-Cloud-Nutzung überträgt Gesprächsinhalte und den für die Anfrage verwendeten
-Persona-/Erinnerungskontext an den Anbieter. [OpenCode Go](https://opencode.ai/docs/go/)
-ist laut Anbieter für Coding-Agenten gedacht; Avatar-Chat kann daher
-anbieterbedingten Einschränkungen unterliegen. Emma Studio identifiziert sich
-mit eigenem User-Agent und sendet eine stabile Gesprächskennung.
-`./studio.sh start --no-llm` lässt das lokale Sprachmodell aus; STT, TTS und
-Kamera-Bildanalyse bleiben lokal und benötigen weiterhin ihre bisherigen Dienste.
-
-## Wichtige Hinweise
-
-- **Port-Konflikte:** `studio.sh start` prüft vorab, wem :8080/:8880/:8890 gehören.
-  Hält ein Fremdprozess einen davon (typisch ein vergessener Dev-Server
-  `python -m studio --port 8890`), bricht der Start sofort mit PID und Kommandozeile
-  des Halters ab — statt in den 90-s-Health-Timeout zu laufen. `status` zeigt denselben
-  Konflikt an.
-- **Bot-Token-Konflikt:** Smart_Hermione_bot wird vom alten Chatbot gepollt.
-  Beide gleichzeitig = Update-Kampf. Erst Chatbot stoppen, dann `--telegram`.
-- **GPU 1 ist geteilt (STT + VLM):** Der VLM-Kaltstart (moondream, ~15,5 GB) belegt
-  Gerät 1 in der Spitze mit ~23 GB (bge-m3 + OmniVoice + Whisper + VLM auf 24 GB).
-  Er läuft deshalb unter einem gemeinsamen Schloss mit jeder Whisper-Inferenz
-  (`studio/speech/core/device_lock.py`) und wird bei einem Videoanruf **beim
-  Anrufstart** vorgeladen (`POST /api/calls/start {"video": true}`), nicht erst beim
-  ersten Kamerabild. Ohne das reißt der parallele Kaltstart den ganzen Prozess per
-  SIGABRT ab (CUDA-OOM in CTranslate2s Graph-Capture — Anruf tot). Passt das Modell
-  nicht, läuft der Videoanruf ohne Bildkontext weiter, statt zu sterben.
-  Nachprüfbar mit `scripts/repro_vlm_stt_race.py` (braucht die echten Modelle).
-- **Sprachfelder sind zweierlei:** das Persona-Feld `language` (und der Silent-Turn-Pfad)
-  enthält **Klarnamen** wie `"German"`, der Session-/STT-Pfad **ISO-Codes** wie `"de"`.
-  Wer daraus einen Whisper-Code braucht, muss `speech.utils.whisper_language_code`
-  benutzen — Whisper kennt nur Codes und wirft sonst `ValueError`, womit die
-  Visem-Timeline eines Satzes komplett ausfällt (Lippen stehen still).
-- **Hängende Call-Sessions:** Eine „aktive" Session ohne lebende Realtime-Verbindung
-  (Prozess abgestürzt/neu gestartet, Tab weg ohne Auflegen) wird beim nächsten
-  Anrufstart nach `STUDIO_STALE_CALL_GRACE` (90 s) automatisch abgeschlossen —
-  sonst sperrt der Überrest die Persona dauerhaft aus jedem weiteren Anruf.
-- OmniVoice: `~/services/omnivoice/toggle-omnivoice` (Port 8880, 3060 Ti)
-- ComfyUI muss laufen für Video-Messages (`systemctl --user start comfyui`)
-- Workflows in `workflows/` stammen aus video-gen-bot (fl2va BF16, beta57,
-  Musubi-LoRA 0.4, RTX-VSR 2× ULTRA)
-- **Logs enthalten standardmäßig keine Gesprächsinhalte** (nur Zeichenzahlen).
-  Zum Debuggen: `STUDIO_LOG_TRANSCRIPTS=1` setzen bzw. `python -m studio --log_transcripts`
-  — dann stehen die Transkripte im Journal und bleiben dort.
-
-## Avatar memory
-
-Full Telegram and Facetime transcripts and summaries are searchable in the existing
-SQLite database. Each session has a six-character memory ID shown before its
-summary in the persona prompt. The avatar can search across its history or within
-one session, then read exact paginated conversation text. Memory calls and results
-stay private; up to five calls are allowed before the final user-facing answer.
-
-Retrieval uses Unicode-aware FTS5 keyword search without another service or GPU
-model. Memory-enabled voice turns buffer model output before speech so tool JSON
-and stray search preambles cannot be spoken. See
-[the architecture and tool protocol](docs/memory-architecture.md) for migration,
-limits, extension points and tests.
 
 ## Tests
 
 ```bash
 python -m pytest tests/ -q
 ```
+
+The suite is isolated: no model, TTS, ComfyUI or Telegram network is required. It covers the
+realtime protocol and model routing, sessions and memory retrieval, the pipeline state machine,
+Telegram command and voice paths, backchannels, silent turns, speech utilities and visual cycles.
+`AUDIT-2026-09-22.md` records the last full code audit — the defects it found, what was removed,
+and what is still structural work.
+
+## Limits
+
+- A trusted, single-user studio. There is no authentication; keep it on loopback or a trusted
+  network, and do not expose port 8890 directly.
+- Voice cloning needs a reference recording you have the right to use. Personas and avatars are
+  local data and are not part of this repository.
+- The video-message path is the heaviest: ComfyUI plus a video model on the same box, and it is not
+  wired into the web UI yet.
+- Cloud providers are optional. With a local model, no conversation leaves the machine.
